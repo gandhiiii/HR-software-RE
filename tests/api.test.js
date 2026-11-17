@@ -836,3 +836,60 @@ test('task CRUD, role enforcement and anonymous access', async () => {
     await anonymous.close();
   }
 });
+
+test('an employee with no linked employee id cannot view or status-change an unassigned task', async () => {
+  const h = await setupTasks('hr');
+  try {
+    // tasks.assigned_to is nullable; create an unassigned task via the repo
+    // helper. A raw null !== null comparison would let an unlinked employee
+    // account read it and advance its status.
+    const taskId = insertRow(h.db, 'tasks', {
+      title: 'Unassigned',
+      assigned_to: null,
+      assigned_by: 2,
+      status: 'open',
+    });
+    const unlinked = await loginAsOtherEmployee(h, 'employee_unlinked', null);
+
+    // normalize through ownEmployeeId → coherent 400 for an unlinked account.
+    assert.equal((await unlinked.get('/api/tasks')).status, 400);
+    assert.equal((await unlinked.get(`/api/tasks/${taskId}`)).status, 400);
+    assert.equal((await unlinked.get(`/api/tasks/${taskId}/comments`)).status, 400);
+    assert.equal(
+      (await unlinked.patch(`/api/tasks/${taskId}`, { status: 'done' })).status,
+      400,
+    );
+    assert.equal(getRow(h.db, 'tasks', taskId).status, 'open', 'status unchanged');
+  } finally {
+    await h.close();
+  }
+});
+
+test('deleting a task removes its comments but leaves other tasks comments intact', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const created = await createTask(h.client);
+    const employee = await loginAs(h, 'employee');
+    const first = await employee.post(`/api/tasks/${created.id}/comments`, { comment: 'First' });
+    const second = await h.client.post(`/api/tasks/${created.id}/comments`, { comment: 'Second' });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    assert.equal((await h.client.get(`/api/tasks/${created.id}/comments`)).body.length, 2);
+
+    const other = await createTask(h.client, { title: 'Other task' });
+    const kept = await h.client.post(`/api/tasks/${other.id}/comments`, { comment: 'Keep me' });
+    assert.equal(kept.status, 201);
+
+    assert.equal((await h.client.delete(`/api/tasks/${created.id}`)).status, 200);
+    assert.equal(getRow(h.db, 'tasks', created.id), null, 'task deleted');
+    assert.equal(getRow(h.db, 'task_comments', first.body.id), null, 'first comment removed');
+    assert.equal(getRow(h.db, 'task_comments', second.body.id), null, 'second comment removed');
+    assert.notEqual(getRow(h.db, 'task_comments', kept.body.id), null, 'other task comment kept');
+
+    // Deleting a task with no comments still works; unknown ids still 404.
+    assert.equal((await h.client.delete(`/api/tasks/${other.id}`)).status, 200);
+    assert.equal((await h.client.delete('/api/tasks/999999')).status, 404);
+  } finally {
+    await h.close();
+  }
+});

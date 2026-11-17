@@ -105,7 +105,10 @@ function resolveAssignee(db, value) {
 /** Employees may only read tasks assigned to them; HR/admin may read any. */
 function assertCanView(task, user) {
   if (!task) throw httpError(404, 'Task not found');
-  if (user?.role === 'employee' && task.assigned_to !== user.employee_id) {
+  // Normalize through ownEmployeeId so an unlinked employee account (null id)
+  // cannot match a nullable tasks.assigned_to. This also gives the same 400 as
+  // the list path for such accounts instead of silently granting access.
+  if (user?.role === 'employee' && task.assigned_to !== ownEmployeeId(user)) {
     throw httpError(404, 'Task not found');
   }
 }
@@ -171,8 +174,9 @@ function updateTask(db, user, id, body) {
   const data = pick(body, TASK_FIELDS);
   if (user?.role === 'employee') {
     // Only the assignee may change status, and status is the only field they
-    // may change. assertCanView already confirmed the task is theirs to see.
-    if (task.assigned_to !== user.employee_id) {
+    // may change. Normalize through ownEmployeeId (as the list/view paths do)
+    // so a null employee id cannot match a nullable assigned_to.
+    if (task.assigned_to !== ownEmployeeId(user)) {
       throw httpError(403, 'Only the assignee may change task status');
     }
     const extraFields = Object.keys(data).filter((field) => field !== 'status');
@@ -213,6 +217,20 @@ function listComments(db, user, id) {
   return { status: 200, body: listRows(db, 'task_comments', 'task_id = ?', [id]) };
 }
 
+/**
+ * Delete a task and its comments. `task_comments` has no FK / ON DELETE CASCADE
+ * and foreign_keys is not enabled, so remove the comment rows first to avoid
+ * orphaned comments that could never be reached again.
+ */
+function deleteTask(db, id) {
+  if (!getRow(db, 'tasks', id)) throw httpError(404, 'Task not found');
+  for (const comment of listRows(db, 'task_comments', 'task_id = ?', [id])) {
+    deleteRow(db, 'task_comments', comment.id);
+  }
+  deleteRow(db, 'tasks', id);
+  return { status: 200, body: { ok: true } };
+}
+
 /** Register all task routes. */
 export function registerTaskRoutes(router) {
   router.register('POST', '/api/tasks', HR_ROLES, async ({ db, user, body }) =>
@@ -233,12 +251,9 @@ export function registerTaskRoutes(router) {
     updateTask(db, user, positiveId(params.id) ?? -1, body),
   );
 
-  router.register('DELETE', '/api/tasks/:id', HR_ROLES, async ({ db, params }) => {
-    if (!deleteRow(db, 'tasks', positiveId(params.id) ?? -1)) {
-      throw httpError(404, 'Task not found');
-    }
-    return { status: 200, body: { ok: true } };
-  });
+  router.register('DELETE', '/api/tasks/:id', HR_ROLES, async ({ db, params }) =>
+    deleteTask(db, positiveId(params.id) ?? -1),
+  );
 
   router.register('POST', '/api/tasks/:id/comments', ALL_ROLES, async ({ db, user, params, body }) =>
     addComment(db, user, positiveId(params.id) ?? -1, body),
