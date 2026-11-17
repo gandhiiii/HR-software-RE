@@ -12,6 +12,7 @@ import { openDatabase } from './lib/db.js';
 import { createRouter } from './lib/router.js';
 import { registerAuthRoutes } from './lib/auth.js';
 import { sendJson } from './lib/http.js';
+import { renderStatic } from './lib/static.js';
 
 const HOST = '127.0.0.1';
 const PORT = 3000;
@@ -40,12 +41,18 @@ export function startServer({ db, port = PORT, host = HOST, registerRoutes } = {
   registerAuthRoutes(router);
   if (typeof registerRoutes === 'function') registerRoutes(router);
 
-  const server = http.createServer((req, res) => {
-    router.handle(req, res, { db }).catch((error) => {
+  const server = http.createServer(async (req, res) => {
+    // Static UI files are served first (Task 11). Anything not handled here —
+    // every /api/* route, unknown paths, and non-GET/HEAD requests — falls
+    // through to the JSON router unchanged, so auth and role checks are intact.
+    try {
+      if (await renderStatic(req, res)) return;
+      await router.handle(req, res, { db });
+    } catch (error) {
       // Defensive backstop: router.handle already converts throws to JSON 500s.
       if (res.headersSent) return res.end();
       sendJson(res, 500, { error: error?.message ?? 'Internal server error' });
-    });
+    }
   });
   server.bindAddress = { port, host };
   // Exposed so later tasks can register additional routes onto a live server.
