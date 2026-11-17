@@ -893,3 +893,273 @@ test('deleting a task removes its comments but leaves other tasks comments intac
     await h.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Assets
+// ---------------------------------------------------------------------------
+
+/** Seed `employee` is linked to employee id 3; `hr` to id 2; `admin` to none. */
+const ASSET_EMPLOYEE_ID = 3;
+
+async function setupAssets(role = 'hr') {
+  // Dynamic import keeps the other API tests loadable during RED, while the
+  // assets module does not exist yet. Only the asset tests should fail first.
+  const { registerAssetRoutes } = await import('../api/assets.js');
+  const db = makeDb();
+  const server = startServer({
+    db,
+    registerRoutes: (router) => {
+      registerAssetRoutes(router);
+    },
+  });
+  await listen(server);
+  const client = makeClient(server);
+  if (role) {
+    const login = await client.post('/api/auth/login', { username: role, password: 'admin123' });
+    assert.equal(login.status, 200, `login as ${role} should succeed`);
+  }
+  return {
+    db,
+    server,
+    client,
+    makeClient: () => makeClient(server),
+    close: async () => {
+      await close(server);
+      db.close();
+    },
+  };
+}
+
+async function createAsset(client, overrides = {}) {
+  const res = await client.post('/api/assets', {
+    name: 'ThinkPad X1',
+    type: 'Laptop',
+    serial: 'SN-1001',
+    purchase_date: '2026-01-10',
+    value: 85000,
+    ...overrides,
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  return res.body;
+}
+
+test('HR creates an asset with available status and reads it back', async () => {
+  const h = await setupAssets('hr');
+  try {
+    const created = await createAsset(h.client);
+    assert.ok(Number.isInteger(created.id) && created.id > 0);
+    assert.equal(created.name, 'ThinkPad X1');
+    assert.equal(created.serial, 'SN-1001');
+    assert.equal(created.value, 85000);
+    assert.equal(created.status, 'available', 'a new asset starts available');
+
+    const list = await h.client.get('/api/assets');
+    assert.equal(list.status, 200);
+    assert.equal(list.body.length, 1);
+    assert.equal(list.body[0].id, created.id);
+
+    const fetched = await h.client.get(`/api/assets/${created.id}`);
+    assert.equal(fetched.status, 200);
+    assert.equal(fetched.body.name, 'ThinkPad X1');
+    assert.equal(getRow(h.db, 'assets', created.id).status, 'available');
+
+    // Optional columns may be omitted; value defaults to 0 and type/serial to null.
+    const minimal = await h.client.post('/api/assets', { name: 'Mouse' });
+    assert.equal(minimal.status, 201, JSON.stringify(minimal.body));
+    assert.equal(minimal.body.value, 0);
+    assert.equal(minimal.body.type, null);
+    assert.equal(minimal.body.status, 'available');
+  } finally {
+    await h.close();
+  }
+});
+
+test('assigning an asset flips availability to assigned, return restores available, history is recorded', async () => {
+  const h = await setupAssets('hr');
+  try {
+    const asset = await createAsset(h.client);
+
+    const assigned = await h.client.post(`/api/assets/${asset.id}/assign`, {
+      employeeId: ASSET_EMPLOYEE_ID,
+    });
+    assert.equal(assigned.status, 201, JSON.stringify(assigned.body));
+    assert.equal(assigned.body.asset_id, asset.id);
+    assert.equal(assigned.body.employee_id, ASSET_EMPLOYEE_ID);
+    assert.equal(assigned.body.status, 'assigned');
+    assert.ok(assigned.body.assigned_at, 'assignment timestamp is recorded');
+    assert.equal(assigned.body.returned_at, null);
+
+    assert.equal((await h.client.get(`/api/assets/${asset.id}`)).body.status, 'assigned');
+    assert.equal(getRow(h.db, 'assets', asset.id).status, 'assigned');
+    assert.equal(getRow(h.db, 'asset_assignments', assigned.body.id).status, 'assigned');
+
+    const history = await h.client.get(`/api/assets/${asset.id}/history`);
+    assert.equal(history.status, 200);
+    assert.equal(history.body.length, 1);
+    assert.equal(history.body[0].id, assigned.body.id);
+
+    const returned = await h.client.post(`/api/assets/${asset.id}/return`, {});
+    assert.equal(returned.status, 200, JSON.stringify(returned.body));
+    assert.equal(returned.body.status, 'returned');
+    assert.ok(returned.body.returned_at, 'return timestamp is recorded');
+
+    assert.equal((await h.client.get(`/api/assets/${asset.id}`)).body.status, 'available');
+    assert.equal(getRow(h.db, 'assets', asset.id).status, 'available');
+    assert.equal(getRow(h.db, 'asset_assignments', assigned.body.id).status, 'returned');
+
+    const historyAfter = await h.client.get(`/api/assets/${asset.id}/history`);
+    assert.equal(historyAfter.body.length, 1, 'returning does not erase history');
+    assert.equal(historyAfter.body[0].status, 'returned');
+    assert.ok(historyAfter.body[0].returned_at);
+
+    // Re-assigning after a return creates a second, separate history row.
+    const second = await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: 1 });
+    assert.equal(second.status, 201);
+    const fullHistory = await h.client.get(`/api/assets/${asset.id}/history`);
+    assert.equal(fullHistory.body.length, 2);
+    assert.deepEqual(
+      fullHistory.body.map((row) => row.status),
+      ['assigned', 'returned'],
+      'newest assignment is listed first',
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('assigning an unavailable asset returns 409 and records no extra assignment', async () => {
+  const h = await setupAssets('hr');
+  try {
+    const asset = await createAsset(h.client);
+    const first = await h.client.post(`/api/assets/${asset.id}/assign`, {
+      employeeId: ASSET_EMPLOYEE_ID,
+    });
+    assert.equal(first.status, 201);
+
+    const conflict = await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: 1 });
+    assert.equal(conflict.status, 409, 'a second assignment is rejected');
+    assert.match(conflict.body.error, /availab/i);
+    assert.equal((await h.client.get(`/api/assets/${asset.id}/history`)).body.length, 1);
+    assert.equal(getRow(h.db, 'assets', asset.id).status, 'assigned', 'status is unchanged');
+
+    await h.client.post(`/api/assets/${asset.id}/return`, {});
+    const returnAgain = await h.client.post(`/api/assets/${asset.id}/return`, {});
+    assert.equal(returnAgain.status, 409, 'returning an unassigned asset is a conflict');
+    assert.equal((await h.client.get(`/api/assets/${asset.id}/history`)).body.length, 1);
+
+    // Unknown asset / employee are 404; a bad employee id leaves the asset available.
+    assert.equal((await h.client.post('/api/assets/999999/assign', { employeeId: 1 })).status, 404);
+    assert.equal(
+      (await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: 999999 })).status,
+      404,
+    );
+    assert.equal(getRow(h.db, 'assets', asset.id).status, 'available', 'failed assign did not flip status');
+  } finally {
+    await h.close();
+  }
+});
+
+test('asset PATCH, DELETE and filters behave; invalid fields are 400', async () => {
+  const h = await setupAssets('hr');
+  try {
+    const asset = await createAsset(h.client);
+
+    const patched = await h.client.patch(`/api/assets/${asset.id}`, {
+      name: 'ThinkPad X1 Gen 2',
+      value: 90000,
+      purchase_date: '2026-02-28',
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+    assert.equal(patched.body.name, 'ThinkPad X1 Gen 2');
+    assert.equal(patched.body.value, 90000);
+    assert.equal(patched.body.type, 'Laptop', 'unrelated fields are preserved');
+
+    for (const overrides of [
+      { purchase_date: '2026-02-30' },
+      { value: -1 },
+      { name: '   ' },
+      { type: { nope: true } },
+    ]) {
+      const bad = await h.client.patch(`/api/assets/${asset.id}`, overrides);
+      assert.equal(bad.status, 400, JSON.stringify(overrides));
+    }
+    assert.equal(getRow(h.db, 'assets', asset.id).name, 'ThinkPad X1 Gen 2', 'bad patches not stored');
+
+    const monitor = await createAsset(h.client, {
+      name: 'Dell Monitor',
+      type: 'Monitor',
+      serial: 'SN-2002',
+      value: 15000,
+    });
+    assert.equal((await h.client.get('/api/assets?type=Monitor')).body.length, 1);
+    assert.equal((await h.client.get('/api/assets?status=available')).body.length, 2);
+    assert.equal((await h.client.get('/api/assets?status=assigned')).body.length, 0);
+
+    assert.equal((await h.client.get('/api/assets/999999')).status, 404);
+    assert.equal((await h.client.patch('/api/assets/999999', { name: 'Ghost' })).status, 404);
+    assert.equal((await h.client.delete('/api/assets/999999')).status, 404);
+    assert.equal((await h.client.get('/api/assets/999999/history')).status, 404);
+
+    const assignment = await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: 1 });
+    assert.equal(assignment.status, 201);
+    assert.equal((await h.client.delete(`/api/assets/${asset.id}`)).status, 200);
+    assert.equal(getRow(h.db, 'assets', asset.id), null, 'asset deleted');
+    assert.equal(getRow(h.db, 'asset_assignments', assignment.body.id), null, 'history cleaned up');
+    assert.equal((await h.client.get(`/api/assets/${asset.id}`)).status, 404);
+    assert.ok(getRow(h.db, 'assets', monitor.id), 'other assets are untouched');
+  } finally {
+    await h.close();
+  }
+});
+
+test('asset routes enforce roles: employee gets 403, anonymous gets 401', async () => {
+  const h = await setupAssets('employee');
+  try {
+    const hr = h.makeClient();
+    const hrLogin = await hr.post('/api/auth/login', { username: 'hr', password: 'admin123' });
+    assert.equal(hrLogin.status, 200);
+    const asset = await createAsset(hr);
+    assert.equal((await h.client.get('/api/assets')).status, 403);
+    assert.equal((await h.client.post('/api/assets', { name: 'Nope' })).status, 403);
+    assert.equal((await h.client.get(`/api/assets/${asset.id}`)).status, 403);
+    assert.equal((await h.client.patch(`/api/assets/${asset.id}`, { name: 'Nope' })).status, 403);
+    assert.equal((await h.client.delete(`/api/assets/${asset.id}`)).status, 403);
+    assert.equal((await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: 1 })).status, 403);
+    assert.equal((await h.client.post(`/api/assets/${asset.id}/return`, {})).status, 403);
+    assert.equal((await h.client.get(`/api/assets/${asset.id}/history`)).status, 403);
+  } finally {
+    await h.close();
+  }
+
+  const anonymous = await setupAssets(null);
+  try {
+    assert.equal((await anonymous.client.get('/api/assets')).status, 401);
+    assert.equal((await anonymous.client.post('/api/assets', { name: 'Nope' })).status, 401);
+    assert.equal((await anonymous.client.get('/api/assets/1/history')).status, 401);
+  } finally {
+    await anonymous.close();
+  }
+});
+
+test('strict ids on asset assign reject type-confused employee ids and malformed asset ids', async () => {
+  const h = await setupAssets('hr');
+  try {
+    const asset = await createAsset(h.client);
+    for (const employeeId of ['abc', 0, -1, true, [1], null, 1.5]) {
+      const res = await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId });
+      assert.equal(res.status, 400, `employeeId ${JSON.stringify(employeeId)} → ${JSON.stringify(res.body)}`);
+      assert.match(res.body.error, /employeeId/i);
+    }
+    assert.equal(getRow(h.db, 'assets', asset.id).status, 'available', 'nothing was assigned');
+
+    // Numeric strings are still accepted, and path ids are strict too.
+    const ok = await h.client.post(`/api/assets/${asset.id}/assign`, { employeeId: '3' });
+    assert.equal(ok.status, 201, JSON.stringify(ok.body));
+    assert.equal(ok.body.employee_id, ASSET_EMPLOYEE_ID);
+    assert.equal((await h.client.get('/api/assets/abc/history')).status, 400);
+    assert.equal((await h.client.post('/api/assets/1.5/return', {})).status, 400);
+    assert.equal((await h.client.post('/api/assets/true/assign', { employeeId: 1 })).status, 400);
+  } finally {
+    await h.close();
+  }
+});
