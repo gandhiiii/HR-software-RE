@@ -1,0 +1,14 @@
+{
+  "name": "hrms",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local, offline HRMS built with Node.js built-ins only",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
