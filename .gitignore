@@ -1,0 +1,14 @@
+# Runtime database and SQLite side files (data/ is created on first start)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+
+# Local artifacts / logs
+*.log
+.DS_Store
+Thumbs.db

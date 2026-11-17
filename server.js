@@ -13,9 +13,39 @@ import { createRouter } from './lib/router.js';
 import { registerAuthRoutes } from './lib/auth.js';
 import { sendJson } from './lib/http.js';
 import { renderStatic } from './lib/static.js';
+import { registerEmployeeRoutes, registerOrgRoutes } from './api/employees.js';
+import { registerAttendanceRoutes } from './api/attendance.js';
+import { registerLeaveRoutes } from './api/leave.js';
+import { registerPayrollRoutes } from './api/payroll.js';
+import { registerExpenseRoutes } from './api/expenses.js';
+import { registerTaskRoutes } from './api/tasks.js';
+import { registerAssetRoutes } from './api/assets.js';
+import { registerReportRoutes } from './api/reports.js';
+import { registerSettingsRoutes } from './api/settings.js';
 
 const HOST = '127.0.0.1';
 const PORT = 3000;
+
+/**
+ * Register every feature module on a router. Auth routes are registered inside
+ * `startServer` itself, so this covers the remaining API modules only. The
+ * `node server.js` main guard and the end-to-end test share this one helper, so
+ * production wiring and tested wiring cannot drift apart. Tests that need a
+ * narrower surface can still pass their own `registerRoutes` hook to
+ * `startServer` — that hook is additive and remains fully supported.
+ */
+export function registerAllRoutes(router) {
+  registerEmployeeRoutes(router);
+  registerOrgRoutes(router);
+  registerAttendanceRoutes(router);
+  registerLeaveRoutes(router);
+  registerPayrollRoutes(router);
+  registerExpenseRoutes(router);
+  registerTaskRoutes(router);
+  registerAssetRoutes(router);
+  registerReportRoutes(router);
+  registerSettingsRoutes(router);
+}
 
 /**
  * Build the HRMS server. IMPORTANT: this function does NOT listen on a port.
@@ -63,7 +93,9 @@ export function startServer({ db, port = PORT, host = HOST, registerRoutes } = {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const db = openDatabase();
-  const server = startServer({ db });
+  // The production entry point registers the complete application: auth plus
+  // every feature module via registerAllRoutes (see above).
+  const server = startServer({ db, registerRoutes: registerAllRoutes });
   const { port, host } = server.bindAddress;
   server.listen(port, host, () => {
     console.log(`HRMS listening on http://${host}:${port}`);
