@@ -97,7 +97,22 @@ function buildRecord(db, body) {
       throw httpError(400, `${name} must be a valid HH:MM time`);
     }
   }
+  // A backwards (or zero-length) punch pair is a data-entry error, not a real
+  // half-day. Reject it cleanly. A punch-in with NO punch-out is still valid and
+  // is graded Half-day by the calc module, per the approved rules.
+  if (
+    punchIn && punchOut &&
+    minutesOf(punchOut) <= minutesOf(punchIn)
+  ) {
+    throw httpError(400, 'punchOut must be after punchIn');
+  }
   return { employeeId, date: body.date, punchIn: punchIn || null, punchOut: punchOut || null, body };
+}
+
+/** Whole minutes since midnight for an already-validated `HH:MM` string. */
+function minutesOf(hhmm) {
+  const [hours, minutes] = hhmm.split(':').map(Number);
+  return hours * 60 + minutes;
 }
 
 /** Insert or update the single attendance row for an (employee, date) pair. */
@@ -116,24 +131,30 @@ function upsertAttendance(db, row) {
 }
 
 /**
- * Validate, derive and persist one record. When `forcedEmployeeId` is supplied
- * (the /self route) it overrides any client-provided employeeId.
+ * Validate, derive and persist one record.
+ *
+ * `selfService` (the /api/attendance/self route) locks down every rule-affecting
+ * input the employee could otherwise forge: the employee id comes from the
+ * session, `approvedLeave` / `holiday` / `shiftId` supplied by the client are
+ * ignored, and the shift is always resolved from the employee's own record.
+ * Automatic weekly-off/holiday detection is a system rule (date + settings), so
+ * it still applies on both paths.
  */
-function recordAttendance(db, body, forcedEmployeeId) {
-  const effectiveBody =
-    forcedEmployeeId === undefined
-      ? body
-      : { ...body, employeeId: forcedEmployeeId };
-  const record = buildRecord(db, effectiveBody);
+function recordAttendance(db, body, { forcedEmployeeId, selfService = false } = {}) {
+  const record = buildRecord(
+    db,
+    selfService ? { ...body, employeeId: forcedEmployeeId } : body,
+  );
   const settings = settingsMap(db);
   const employee = getRow(db, 'employees', record.employeeId);
-  const shift = resolveShift(db, record.body, employee, settings);
+  // On the self path pass an empty body so no client shiftId can be honoured.
+  const shift = resolveShift(db, selfService ? {} : record.body, employee, settings);
   const derived = deriveAttendance({
     punchIn: record.punchIn,
     punchOut: record.punchOut,
     shift,
-    approvedLeave: body.approvedLeave === true,
-    holiday: body.holiday === true || isHoliday(db, record.date, settings),
+    approvedLeave: !selfService && body.approvedLeave === true,
+    holiday: (!selfService && body.holiday === true) || isHoliday(db, record.date, settings),
     // Grace comes from the resolved shift (which already fell back to settings).
     overtimeCapMinutes: Number(settings.overtime_cap_minutes ?? 240),
   });
@@ -163,8 +184,8 @@ export function registerAttendanceRoutes(router) {
     if (employeeId === null) {
       throw httpError(400, 'No employee is linked to this account');
     }
-    // Ignore any client-supplied employeeId: this route is own-record only.
-    return recordAttendance(db, body, employeeId);
+    // Lock down employee id AND every rule-affecting flag/shift for this path.
+    return recordAttendance(db, body, { forcedEmployeeId: employeeId, selfService: true });
   });
 
   // List attendance, optionally filtered by ?employeeId=&from=&to=.

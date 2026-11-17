@@ -4,6 +4,7 @@ import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { deriveAttendance } from '../lib/calc/attendance.js';
 import { registerAttendanceRoutes } from '../api/attendance.js';
+import { insertRow } from '../lib/repo.js';
 
 const SHIFT = { start_time: '09:00', end_time: '18:00', grace_minutes: 10, weekly_off_day: 0 };
 
@@ -236,6 +237,87 @@ test('employee role records only their own attendance through /api/attendance/se
     assert.equal((await h.client.post('/api/attendance', {
       employeeId: 3, date: '2026-01-05',
     })).status, 403);
+  } finally {
+    await h.close();
+  }
+});
+
+test('self-recording ignores client-supplied approvedLeave, holiday and shiftId', async () => {
+  const h = await setup('employee'); // seeded employee_id = 3, shift 1 (09:00-18:00, grace 10)
+  try {
+    // A permissive-looking alternate shift with an earlier start/end. If a
+    // client could pick it, the punches below would be graded Half-day (60 min
+    // late) with 60 min of overtime. It must be ignored on the self path.
+    const altShiftId = insertRow(h.db, 'shifts', {
+      name: 'Alternate Shift',
+      start_time: '08:00',
+      end_time: '17:00',
+      grace_minutes: 0,
+      weekly_off_day: 0,
+    });
+
+    const leave = await h.client.post('/api/attendance/self', {
+      date: '2026-01-05', punchIn: '09:00', punchOut: '18:00', approvedLeave: true,
+    });
+    assert.equal(leave.status, 201, JSON.stringify(leave.body));
+    assert.equal(leave.body.status, 'Present', 'approvedLeave flag must be ignored');
+    assert.equal(leave.body.worked_minutes, 540);
+
+    const holiday = await h.client.post('/api/attendance/self', {
+      date: '2026-01-05', punchIn: '09:00', punchOut: '18:00', holiday: true,
+    });
+    assert.equal(holiday.status, 200, 're-record upserts the same row');
+    assert.equal(holiday.body.status, 'Present', 'holiday flag must be ignored');
+
+    const shift = await h.client.post('/api/attendance/self', {
+      date: '2026-01-05', punchIn: '09:00', punchOut: '18:00', shiftId: altShiftId,
+    });
+    assert.equal(shift.status, 200);
+    assert.equal(shift.body.status, 'Present', 'shiftId must be ignored');
+    assert.equal(shift.body.late_minutes, 0, 'employee shift start must be used');
+    assert.equal(shift.body.overtime_minutes, 0, 'alternate shift end must not create overtime');
+    assert.equal(shift.body.worked_minutes, 540);
+
+    // Sanity: the same alternate shift IS honoured on the HR path (same db).
+    const hrClient = makeClient(h.server);
+    const hrLogin = await hrClient.post('/api/auth/login', {
+      username: 'hr', password: 'admin123',
+    });
+    assert.equal(hrLogin.status, 200);
+    const hrRecord = await hrClient.post('/api/attendance', {
+      employeeId: 3, date: '2026-01-05', punchIn: '09:00', punchOut: '18:00',
+      shiftId: altShiftId,
+    });
+    assert.equal(hrRecord.body.status, 'Half-day', 'HR may still choose a shift');
+    assert.equal(hrRecord.body.overtime_minutes, 60);
+  } finally {
+    await h.close();
+  }
+});
+
+test('punchOut at or before punchIn is rejected with 400', async () => {
+  const h = await setup('hr');
+  try {
+    const backwards = await h.client.post('/api/attendance', {
+      employeeId: 3, date: '2026-01-05', punchIn: '18:00', punchOut: '09:00',
+    });
+    assert.equal(backwards.status, 400);
+    assert.match(backwards.body.error, /punchOut/i);
+
+    const equal = await h.client.post('/api/attendance', {
+      employeeId: 3, date: '2026-01-06', punchIn: '09:00', punchOut: '09:00',
+    });
+    assert.equal(equal.status, 400);
+
+    // Punch-in with NO punch-out stays valid and is still graded Half-day.
+    const noOut = await h.client.post('/api/attendance', {
+      employeeId: 3, date: '2026-01-07', punchIn: '09:00',
+    });
+    assert.equal(noOut.status, 201, JSON.stringify(noOut.body));
+    assert.equal(noOut.body.status, 'Half-day');
+
+    const all = await h.client.get('/api/attendance');
+    assert.equal(all.body.length, 1, 'rejected rows were not stored');
   } finally {
     await h.close();
   }
