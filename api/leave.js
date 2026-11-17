@@ -13,9 +13,17 @@
 import { requireFields, isIsoDate } from '../lib/validate.js';
 import { getRow, listRows, insertRow, updateRow } from '../lib/repo.js';
 import { applyLeaveDecision } from '../lib/calc/leave.js';
+import { LEAVE_TYPES } from '../lib/db.js';
 
 const HR_ROLES = ['admin', 'hr'];
 const ALL_ROLES = ['admin', 'hr', 'employee'];
+
+// Authoritative opening balances keyed by leave type name (from the seed).
+// Leave types themselves carry no opening-balance column, so this map is the
+// single source of truth used when provisioning new hires' balance rows.
+const OPENING_BY_NAME = new Map(
+  LEAVE_TYPES.map(([name, opening]) => [name.toLowerCase(), opening]),
+);
 
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -70,6 +78,37 @@ function findOverlap(db, employeeId, fromDate, toDate) {
   );
 }
 
+/**
+ * Only leave types whose NAME contains "unpaid" are exempt from balance checks.
+ * The decision never infers this from balance values — a zero balance on a
+ * normal type must still fail on overdraw.
+ */
+function isUnlimitedLeave(db, leaveTypeId) {
+  const type = getRow(db, 'leave_types', leaveTypeId);
+  return /unpaid/i.test(type?.name ?? '');
+}
+
+/**
+ * Idempotently create any missing leave_balances rows for one employee from the
+ * seeded opening balances. api/employees.js writes no balances for new hires,
+ * so without this the whole workflow would dead-end for them: empty balance
+ * lists and a 409 on every approval. Uses repo helpers only (real columns).
+ */
+function provisionBalances(db, employeeId) {
+  if (!getRow(db, 'employees', employeeId)) return;
+  for (const type of listRows(db, 'leave_types')) {
+    if (getBalance(db, employeeId, type.id)) continue;
+    const opening = OPENING_BY_NAME.get(String(type.name ?? '').toLowerCase()) ?? 0;
+    insertRow(db, 'leave_balances', {
+      employee_id: employeeId,
+      leave_type_id: type.id,
+      opening_balance: opening,
+      used: 0,
+      remaining: opening,
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reference lists
 // ---------------------------------------------------------------------------
@@ -78,13 +117,21 @@ function listBalances(db, user, query) {
   const clauses = [];
   const params = [];
   if (user.role === 'employee') {
+    const ownId = ownEmployeeId(user);
     clauses.push('employee_id = ?');
-    params.push(ownEmployeeId(user));
+    params.push(ownId);
+    provisionBalances(db, ownId);
   } else if (query.employeeId !== undefined && query.employeeId !== '') {
     const id = positiveId(query.employeeId);
     if (id === null) throw httpError(400, 'employeeId must be a positive integer');
     clauses.push('employee_id = ?');
     params.push(id);
+    provisionBalances(db, id);
+  } else {
+    // HR/admin listing everyone: bring every employee up to date first.
+    for (const employee of listRows(db, 'employees')) {
+      provisionBalances(db, employee.id);
+    }
   }
   const rows = listRows(
     db,
@@ -147,6 +194,8 @@ function applyLeave(db, body, user) {
     user.role === 'employee' ? ownEmployeeId(user) : positiveId(body.employeeId);
   if (employeeId === null) throw httpError(400, 'employeeId must be a positive integer');
   if (!getRow(db, 'employees', employeeId)) throw httpError(404, 'Employee not found');
+  // A new hire may apply before ever listing balances; ensure rows exist.
+  provisionBalances(db, employeeId);
 
   if (findOverlap(db, employeeId, body.fromDate, body.toDate).length > 0) {
     throw httpError(409, 'Overlapping leave request exists for this employee');
@@ -191,6 +240,9 @@ function decide(db, id, action, user) {
   let computed = null;
   let balanceRow = null;
   if (shouldDeduct || shouldRestore) {
+    // Provision on decision too, for requests created before provisioning
+    // existed (or inserted directly). Idempotent for already-provisioned hires.
+    provisionBalances(db, request.employee_id);
     balanceRow = getBalance(db, request.employee_id, request.leave_type_id);
     if (!balanceRow) throw httpError(409, 'No leave balance is configured for this leave type');
     // May throw a 409 for an overdrawn approval — before any write happens.
@@ -198,6 +250,7 @@ function decide(db, id, action, user) {
       balance: balanceRow,
       days: Number(request.days),
       action: shouldRestore ? 'reject' : 'approve',
+      unlimited: isUnlimitedLeave(db, request.leave_type_id),
     });
   }
 

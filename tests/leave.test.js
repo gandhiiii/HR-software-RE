@@ -4,6 +4,7 @@ import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { applyLeaveDecision } from '../lib/calc/leave.js';
 import { registerLeaveRoutes } from '../api/leave.js';
+import { registerEmployeeRoutes } from '../api/employees.js';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -19,12 +20,15 @@ function close(server) {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-/** Listening server with only the leave routes registered on top of auth. */
-async function setup(role = 'hr') {
+/** Listening server with the leave routes registered on top of auth. */
+async function setup(role = 'hr', extraRoutes) {
   const db = makeDb();
   const server = startServer({
     db,
-    registerRoutes: (router) => registerLeaveRoutes(router),
+    registerRoutes: (router) => {
+      if (extraRoutes) extraRoutes(router);
+      registerLeaveRoutes(router);
+    },
   });
   await listen(server);
   const client = makeClient(server);
@@ -90,14 +94,28 @@ test('applyLeaveDecision: rejects invalid action and non-positive days', () => {
   assert.throws(() => applyLeaveDecision({ balance, days: 'three', action: 'approve' }));
 });
 
-test('applyLeaveDecision: a zero-opening balance (Unpaid) is not constrained', () => {
+test('applyLeaveDecision: an explicit unlimited flag (Unpaid type) is not constrained', () => {
   const result = applyLeaveDecision({
     balance: { opening_balance: 0, used: 0, remaining: 0 },
     days: 3,
     action: 'approve',
+    unlimited: true,
   });
   assert.equal(result.used, 3);
   assert.equal(result.remaining, -3, 'negative remaining records days taken without pay');
+});
+
+test('applyLeaveDecision: zero balances alone never grant unlimited approval', () => {
+  assert.throws(
+    () =>
+      applyLeaveDecision({
+        balance: { opening_balance: 0, used: 0, remaining: 0 },
+        days: 3,
+        action: 'approve',
+      }),
+    (error) => error.status === 409,
+    'a balance-backed type with zero remaining must still fail on overdraw',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -431,6 +449,47 @@ test('decision route validates id and action', async () => {
       400,
       'unknown action',
     );
+  } finally {
+    await h.close();
+  }
+});
+
+test('new hires get balances provisioned on demand and can apply/approve leave', async () => {
+  const h = await setup('hr', (router) => registerEmployeeRoutes(router));
+  try {
+    // api/employees.js writes no leave_balances rows, so this hire has none.
+    const created = await h.client.post('/api/employees', {
+      code: 'EMP999', name: 'New Hire', joining_date: '2026-06-01',
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const newId = created.body.id;
+
+    const balances = await h.client.get(`/api/leave/balances?employeeId=${newId}`);
+    assert.equal(balances.status, 200);
+    assert.equal(balances.body.length, 4, 'balances are auto-provisioned for a new employee');
+    assert.equal(balanceOf(balances.body, 1).opening_balance, 12, 'Casual opening from seed');
+    assert.equal(balanceOf(balances.body, 1).remaining, 12);
+    assert.equal(balanceOf(balances.body, 4).opening_balance, 0, 'Unpaid opening from seed');
+
+    const applied = await h.client.post('/api/leave/requests', {
+      employeeId: newId, leaveTypeId: 1, fromDate: '2026-07-01', toDate: '2026-07-03', days: 3,
+    });
+    assert.equal(applied.status, 201, JSON.stringify(applied.body));
+
+    const approved = await h.client.post(`/api/leave/requests/${applied.body.id}/decision`, { action: 'approve' });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.status, 'approved');
+    assert.equal(approved.body.balance.used, 3);
+    assert.equal(approved.body.balance.remaining, 9);
+
+    // Unpaid approval is driven by the type name, not by zero balances.
+    const unpaid = await h.client.post('/api/leave/requests', {
+      employeeId: newId, leaveTypeId: 4, fromDate: '2026-08-01', toDate: '2026-08-02', days: 2,
+    });
+    assert.equal(unpaid.status, 201, JSON.stringify(unpaid.body));
+    const unpaidApproved = await h.client.post(`/api/leave/requests/${unpaid.body.id}/decision`, { action: 'approve' });
+    assert.equal(unpaidApproved.status, 200, JSON.stringify(unpaidApproved.body));
+    assert.equal(unpaidApproved.body.status, 'approved');
   } finally {
     await h.close();
   }
