@@ -5,6 +5,7 @@ import { startServer } from '../server.js';
 import { registerEmployeeRoutes, registerOrgRoutes } from '../api/employees.js';
 import { registerExpenseRoutes } from '../api/expenses.js';
 import { getRow, insertRow } from '../lib/repo.js';
+import { hashPassword } from '../lib/auth.js';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -556,5 +557,282 @@ test('an explicitly invalid employeeId on submit is 400 (submit agrees with list
     assert.equal((await h.client.get('/api/expenses')).body.length, 3);
   } finally {
     await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+/** Seed ids: the `employee` account is linked to employee id 3. */
+const TASK_ASSIGNEE_EMPLOYEE_ID = 3;
+
+async function setupTasks(role = 'hr') {
+  // Dynamic import keeps the other API tests loadable during RED, while the
+  // tasks module does not exist yet. Only the task tests should fail before
+  // the module is implemented.
+  const { registerTaskRoutes } = await import('../api/tasks.js');
+  const db = makeDb();
+  const server = startServer({
+    db,
+    registerRoutes: (router) => {
+      registerTaskRoutes(router);
+    },
+  });
+  await listen(server);
+  const client = makeClient(server);
+  if (role) {
+    const login = await client.post('/api/auth/login', { username: role, password: 'admin123' });
+    assert.equal(login.status, 200, `login as ${role} should succeed`);
+  }
+  return {
+    db,
+    server,
+    client,
+    makeClient: () => makeClient(server),
+    close: async () => {
+      await close(server);
+      db.close();
+    },
+  };
+}
+
+/** Add a fresh employee-role user linked to a different employee and log in. */
+async function loginAsOtherEmployee(h, username, employeeId) {
+  const { salt, hash } = hashPassword('admin123');
+  insertRow(h.db, 'users', {
+    username,
+    password_hash: hash,
+    salt,
+    role: 'employee',
+    employee_id: employeeId,
+  });
+  const client = h.makeClient();
+  const login = await client.post('/api/auth/login', { username, password: 'admin123' });
+  assert.equal(login.status, 200, `login as ${username} should succeed`);
+  return client;
+}
+
+async function createTask(client, overrides = {}) {
+  const res = await client.post('/api/tasks', {
+    title: 'Quarterly report',
+    description: 'Prepare the Q1 report',
+    assigned_to: TASK_ASSIGNEE_EMPLOYEE_ID,
+    due_date: '2099-06-30',
+    priority: 'high',
+    ...overrides,
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  return res.body;
+}
+
+test('HR assigns a task; the assignee sees it via ?mine=1 and can change its status', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const created = await createTask(h.client);
+    assert.ok(Number.isInteger(created.id) && created.id > 0);
+    assert.equal(created.status, 'open');
+    assert.equal(created.priority, 'high');
+    assert.equal(created.assigned_to, TASK_ASSIGNEE_EMPLOYEE_ID);
+    assert.ok(created.assigned_by > 0, 'the creator is recorded');
+    assert.equal(created.overdue, false);
+    assert.equal(getRow(h.db, 'tasks', created.id).assigned_to, TASK_ASSIGNEE_EMPLOYEE_ID);
+
+    const employee = await loginAs(h, 'employee');
+    const mine = await employee.get('/api/tasks?mine=1');
+    assert.equal(mine.status, 200);
+    assert.equal(mine.body.length, 1);
+    assert.equal(mine.body[0].id, created.id);
+
+    const ownList = await employee.get('/api/tasks');
+    assert.equal(ownList.body.length, 1, 'employees only ever see their own tasks');
+    assert.equal(ownList.body[0].id, created.id);
+
+    const changed = await employee.patch(`/api/tasks/${created.id}`, { status: 'in_progress' });
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(changed.body.status, 'in_progress');
+    assert.equal(getRow(h.db, 'tasks', created.id).status, 'in_progress');
+
+    // An assignee may change status, but not the task's other fields.
+    const forbiddenField = await employee.patch(`/api/tasks/${created.id}`, { assigned_to: 1 });
+    assert.equal(forbiddenField.status, 403, 'assignees may only change status');
+    assert.equal(getRow(h.db, 'tasks', created.id).assigned_to, TASK_ASSIGNEE_EMPLOYEE_ID);
+  } finally {
+    await h.close();
+  }
+});
+
+test('only the assignee may change task status; a non-assignee employee gets 403', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const created = await createTask(h.client);
+    const other = await loginAsOtherEmployee(h, 'employee2', 1);
+
+    const forbidden = await other.patch(`/api/tasks/${created.id}`, { status: 'done' });
+    assert.equal(forbidden.status, 403, JSON.stringify(forbidden.body));
+    assert.equal(getRow(h.db, 'tasks', created.id).status, 'open', 'status is unchanged');
+
+    // The real assignee can still transition the task.
+    const employee = await loginAs(h, 'employee');
+    assert.equal(
+      (await employee.patch(`/api/tasks/${created.id}`, { status: 'done' })).status,
+      200,
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('invalid due_date is rejected with 400 on create and update', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const bad = await h.client.post('/api/tasks', {
+      title: 'Bad date task',
+      assigned_to: TASK_ASSIGNEE_EMPLOYEE_ID,
+      due_date: '2026-02-30',
+    });
+    assert.equal(bad.status, 400, JSON.stringify(bad.body));
+    assert.match(bad.body.error, /due_date/i);
+
+    const created = await createTask(h.client);
+    const badPatch = await h.client.patch(`/api/tasks/${created.id}`, { due_date: '2026-13-40' });
+    assert.equal(badPatch.status, 400);
+    assert.equal(getRow(h.db, 'tasks', created.id).due_date, '2099-06-30', 'bad patch not stored');
+
+    // A valid leap day is accepted and a missing due_date is allowed.
+    const leap = await h.client.post('/api/tasks', {
+      title: 'Leap day',
+      assigned_to: TASK_ASSIGNEE_EMPLOYEE_ID,
+      due_date: '2024-02-29',
+    });
+    assert.equal(leap.status, 201, JSON.stringify(leap.body));
+    const noDue = await createTask(h.client, { due_date: null });
+    assert.equal(noDue.due_date, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('overdue is computed from due_date and suppressed for terminal statuses', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const overdue = await createTask(h.client, {
+      title: 'Late open',
+      due_date: '2020-01-01',
+      status: 'open',
+    });
+    assert.equal(overdue.overdue, true, 'past-due open task is overdue');
+
+    const done = await createTask(h.client, {
+      title: 'Late done',
+      due_date: '2020-01-01',
+      status: 'done',
+    });
+    assert.equal(done.overdue, false, 'a completed task is never overdue');
+
+    const cancelled = await createTask(h.client, {
+      title: 'Late cancelled',
+      due_date: '2020-01-01',
+      status: 'cancelled',
+    });
+    assert.equal(cancelled.overdue, false, 'a cancelled task is never overdue');
+
+    const future = await createTask(h.client, { title: 'Future', due_date: '2099-01-01' });
+    assert.equal(future.overdue, false);
+
+    const noDue = await createTask(h.client, { title: 'No due date', due_date: null });
+    assert.equal(noDue.overdue, false);
+
+    const list = await h.client.get('/api/tasks');
+    const byId = Object.fromEntries(list.body.map((t) => [t.id, t]));
+    assert.equal(byId[overdue.id].overdue, true);
+    assert.equal(byId[done.id].overdue, false);
+    assert.equal(byId[cancelled.id].overdue, false);
+    assert.equal(byId[future.id].overdue, false);
+    assert.equal(byId[noDue.id].overdue, false);
+
+    const fetched = await h.client.get(`/api/tasks/${overdue.id}`);
+    assert.equal(fetched.body.overdue, true, 'overdue is present on GET :id too');
+  } finally {
+    await h.close();
+  }
+});
+
+test('comments can be added to and listed on a task', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const created = await createTask(h.client);
+    const employee = await loginAs(h, 'employee');
+
+    const empty = await employee.post(`/api/tasks/${created.id}/comments`, { comment: '   ' });
+    assert.equal(empty.status, 400);
+
+    const added = await employee.post(`/api/tasks/${created.id}/comments`, {
+      comment: 'Started today',
+    });
+    assert.equal(added.status, 201, JSON.stringify(added.body));
+    assert.equal(added.body.comment, 'Started today');
+    assert.equal(added.body.user_id, 3, 'comment is attributed to the signed-in user');
+    assert.equal(added.body.task_id, created.id);
+
+    const listed = await employee.get(`/api/tasks/${created.id}/comments`);
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.length, 1);
+    assert.equal(listed.body[0].comment, 'Started today');
+    assert.ok(listed.body[0].created_at);
+
+    assert.equal(
+      (await h.client.post('/api/tasks/999999/comments', { comment: 'x' })).status,
+      404,
+    );
+    assert.equal((await h.client.get('/api/tasks/999999/comments')).status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test('task CRUD, role enforcement and anonymous access', async () => {
+  const h = await setupTasks('hr');
+  try {
+    const created = await createTask(h.client, { priority: 'low' });
+    assert.equal((await h.client.get(`/api/tasks/${created.id}`)).body.title, 'Quarterly report');
+
+    const patched = await h.client.patch(`/api/tasks/${created.id}`, {
+      title: 'Renamed',
+      priority: 'urgent',
+    });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.body.title, 'Renamed');
+    assert.equal(patched.body.priority, 'urgent');
+    assert.equal(patched.body.description, 'Prepare the Q1 report', 'unrelated fields preserved');
+
+    const admin = await loginAs(h, 'admin');
+    assert.equal(
+      (await admin.post('/api/tasks', { title: 'Admin task', assigned_to: 3 })).status,
+      201,
+    );
+
+    const employee = await loginAs(h, 'employee');
+    assert.equal(
+      (await employee.post('/api/tasks', { title: 'Nope', assigned_to: 3 })).status,
+      403,
+      'only HR/admin may create tasks',
+    );
+    assert.equal((await employee.delete(`/api/tasks/${created.id}`)).status, 403);
+
+    assert.equal((await h.client.delete(`/api/tasks/${created.id}`)).status, 200);
+    assert.equal((await h.client.get(`/api/tasks/${created.id}`)).status, 404);
+    assert.equal((await h.client.patch('/api/tasks/999999', { status: 'done' })).status, 404);
+    assert.equal((await h.client.delete('/api/tasks/999999')).status, 404);
+  } finally {
+    await h.close();
+  }
+
+  const anonymous = await setupTasks(null);
+  try {
+    assert.equal((await anonymous.client.get('/api/tasks')).status, 401);
+    assert.equal((await anonymous.client.post('/api/tasks', { title: 'x' })).status, 401);
+  } finally {
+    await anonymous.close();
   }
 });
