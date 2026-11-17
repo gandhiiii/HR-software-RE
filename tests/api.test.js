@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { registerEmployeeRoutes, registerOrgRoutes } from '../api/employees.js';
-import { insertRow } from '../lib/repo.js';
+import { registerExpenseRoutes } from '../api/expenses.js';
+import { getRow, insertRow } from '../lib/repo.js';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -292,6 +293,218 @@ test('org routes list departments and designations for hr/admin', async () => {
       designations.body.map((row) => row.name).sort(),
       ['HR Manager', 'Software Engineer'],
     );
+  } finally {
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Expenses
+// ---------------------------------------------------------------------------
+
+/** Seed `employee` is linked to employee id 3; `hr` to id 2; `admin` to none. */
+const EXPENSE_EMPLOYEE_ID = 3;
+
+async function setupExpenses(role = 'hr') {
+  const db = makeDb();
+  const server = startServer({
+    db,
+    registerRoutes: (router) => {
+      registerExpenseRoutes(router);
+    },
+  });
+  await listen(server);
+  const client = makeClient(server);
+  if (role) {
+    const login = await client.post('/api/auth/login', { username: role, password: 'admin123' });
+    assert.equal(login.status, 200, `login as ${role} should succeed`);
+  }
+  return {
+    db,
+    server,
+    client,
+    makeClient: () => makeClient(server),
+    close: async () => {
+      await close(server);
+      db.close();
+    },
+  };
+}
+
+/** A second, independently-authenticated client against the same server. */
+async function loginAs(h, role) {
+  const client = h.makeClient();
+  const login = await client.post('/api/auth/login', { username: role, password: 'admin123' });
+  assert.equal(login.status, 200, `login as ${role} should succeed`);
+  return client;
+}
+
+test('employee POST /api/expenses submits a pending 1200 claim for themselves', async () => {
+  const h = await setupExpenses('employee');
+  try {
+    const res = await h.client.post('/api/expenses', {
+      category: 'Travel',
+      amount: 1200,
+      receipt_note: 'Taxi to client site',
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    assert.equal(res.body.category, 'Travel');
+    assert.equal(res.body.receipt_note, 'Taxi to client site');
+    assert.equal(res.body.amount, 1200);
+    assert.equal(res.body.status, 'pending');
+    assert.equal(res.body.employee_id, EXPENSE_EMPLOYEE_ID);
+    assert.ok(Number.isInteger(res.body.id) && res.body.id > 0);
+
+    const stored = getRow(h.db, 'expenses', res.body.id);
+    assert.equal(stored.amount, 1200);
+    assert.equal(stored.status, 'pending');
+  } finally {
+    await h.close();
+  }
+});
+
+test('negative, non-numeric and missing expense amounts are rejected with 400', async () => {
+  const h = await setupExpenses('employee');
+  try {
+    for (const amount of [-1, -0.5, 'abc', null]) {
+      const res = await h.client.post('/api/expenses', { category: 'Travel', amount });
+      assert.equal(res.status, 400, `amount ${JSON.stringify(amount)} → ${JSON.stringify(res.body)}`);
+    }
+    const missing = await h.client.post('/api/expenses', { category: 'Travel' });
+    assert.equal(missing.status, 400);
+    const noCategory = await h.client.post('/api/expenses', { amount: 100 });
+    assert.equal(noCategory.status, 400);
+
+    // Nothing rejected was persisted.
+    assert.equal((await h.client.get('/api/expenses')).body.length, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('HR approves or rejects a claim; an employee cannot approve (even their own)', async () => {
+  const h = await setupExpenses('employee');
+  try {
+    const hr = await loginAs(h, 'hr');
+    const created = await h.client.post('/api/expenses', { category: 'Travel', amount: 1200 });
+    assert.equal(created.status, 201);
+    const id = created.body.id;
+
+    // Decision routes are HR/admin only — an employee cannot approve their own.
+    assert.equal(
+      (await h.client.post(`/api/expenses/${id}/decision`, { action: 'approve' })).status,
+      403,
+    );
+
+    const approved = await hr.post(`/api/expenses/${id}/decision`, { action: 'approve' });
+    assert.equal(approved.status, 200, JSON.stringify(approved.body));
+    assert.equal(approved.body.status, 'approved');
+    assert.ok(approved.body.decided_by > 0);
+    assert.ok(approved.body.decided_at);
+
+    // A decided claim cannot be decided again, and invalid inputs are 400/404.
+    assert.equal((await hr.post(`/api/expenses/${id}/decision`, { action: 'reject' })).status, 409);
+    assert.equal((await hr.post(`/api/expenses/${id}/decision`, { action: 'maybe' })).status, 400);
+    assert.equal((await hr.post('/api/expenses/999999/decision', { action: 'approve' })).status, 404);
+
+    const second = await h.client.post('/api/expenses', { category: 'Meals', amount: 500 });
+    assert.equal(second.status, 201);
+    const rejected = await hr.post(`/api/expenses/${second.body.id}/decision`, { action: 'reject' });
+    assert.equal(rejected.status, 200);
+    assert.equal(rejected.body.status, 'rejected');
+  } finally {
+    await h.close();
+  }
+});
+
+test('HR flags an approved expense with a reimbursement month/year for payroll', async () => {
+  const h = await setupExpenses('hr');
+  try {
+    // HR submits on behalf of employee 3, approves, then flags for January 2026.
+    const created = await h.client.post('/api/expenses', {
+      employeeId: EXPENSE_EMPLOYEE_ID,
+      category: 'Travel',
+      amount: 1200,
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const id = created.body.id;
+    assert.equal((await h.client.post(`/api/expenses/${id}/decision`, { action: 'approve' })).status, 200);
+
+    const flagged = await h.client.post(`/api/expenses/${id}/flag-reimbursement`, {
+      month: 1,
+      year: 2026,
+    });
+    assert.equal(flagged.status, 200, JSON.stringify(flagged.body));
+    assert.equal(flagged.body.status, 'approved');
+    assert.equal(flagged.body.reimbursement_month, 1);
+    assert.equal(flagged.body.reimbursement_year, 2026);
+
+    const row = getRow(h.db, 'expenses', id);
+    assert.equal(row.reimbursement_month, 1, 'flag fields persisted for Task 6 to query');
+    assert.equal(row.reimbursement_year, 2026);
+
+    // Invalid month/year, non-approved claim and unknown id are rejected.
+    assert.equal(
+      (await h.client.post(`/api/expenses/${id}/flag-reimbursement`, { month: 13, year: 2026 })).status,
+      400,
+    );
+    assert.equal(
+      (await h.client.post('/api/expenses/999999/flag-reimbursement', { month: 1, year: 2026 })).status,
+      404,
+    );
+    const pendingId = (
+      await h.client.post('/api/expenses', {
+        employeeId: EXPENSE_EMPLOYEE_ID,
+        category: 'Meals',
+        amount: 300,
+      })
+    ).body.id;
+    assert.equal(
+      (await h.client.post(`/api/expenses/${pendingId}/flag-reimbursement`, { month: 1, year: 2026 })).status,
+      409,
+    );
+
+    // Employees cannot flag, and admin (also HR-role) can.
+    const employee = await loginAs(h, 'employee');
+    assert.equal(
+      (await employee.post(`/api/expenses/${id}/flag-reimbursement`, { month: 1, year: 2026 })).status,
+      403,
+    );
+    const admin = await loginAs(h, 'admin');
+    assert.equal(
+      (await admin.post(`/api/expenses/${id}/flag-reimbursement`, { month: 1, year: 2026 })).status,
+      200,
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/expenses is own-only for employees and filterable for HR', async () => {
+  const h = await setupExpenses('employee');
+  try {
+    const hr = await loginAs(h, 'hr');
+    const own = await h.client.post('/api/expenses', { category: 'Travel', amount: 1200 });
+    assert.equal(own.status, 201);
+    const other = await hr.post('/api/expenses', { employeeId: 1, category: 'Meals', amount: 400 });
+    assert.equal(other.status, 201);
+
+    const empList = await h.client.get('/api/expenses');
+    assert.equal(empList.status, 200);
+    assert.equal(empList.body.length, 1);
+    assert.equal(empList.body[0].employee_id, EXPENSE_EMPLOYEE_ID);
+
+    const hrList = await hr.get('/api/expenses');
+    assert.equal(hrList.body.length, 2);
+
+    const byEmployee = await hr.get('/api/expenses?employeeId=1');
+    assert.equal(byEmployee.body.length, 1);
+    assert.equal(byEmployee.body[0].employee_id, 1);
+
+    const byStatus = await hr.get('/api/expenses?status=pending');
+    assert.equal(byStatus.body.length, 2);
+    assert.equal((await hr.get('/api/expenses?status=reimbursed')).body.length, 0);
+    assert.equal((await hr.get('/api/expenses?employeeId=abc')).status, 400);
   } finally {
     await h.close();
   }
