@@ -1163,3 +1163,359 @@ test('strict ids on asset assign reject type-confused employee ids and malformed
     await h.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Reports, settings, holidays and CSV (Task 10)
+// ---------------------------------------------------------------------------
+
+test('rowsToCsv emits a header, escapes delimiters and guards formula injection', async () => {
+  const { rowsToCsv } = await import('../lib/csv.js');
+  const csv = rowsToCsv(
+    [
+      { name: 'Aarav, Sharma', note: '=SUM(A1:A2)', plain: 'ok', quote: 'He said "hi"' },
+      { name: '+cmd', note: '@SUM', plain: 'x', quote: null },
+    ],
+    ['name', 'note', 'plain', 'quote'],
+  );
+  assert.match(csv, /^name,note,plain,quote\r\n/);
+  assert.match(csv, /"Aarav, Sharma"/, 'commas force quoting');
+  assert.match(csv, /'=SUM\(A1:A2\)/, 'leading = is neutralised');
+  assert.match(csv, /'\+cmd/, 'leading + is neutralised');
+  assert.match(csv, /'@SUM/, 'leading @ is neutralised');
+  assert.match(csv, /"He said ""hi"""/, 'inner quotes are doubled');
+  assert.equal(csv.endsWith('\r\n'), true);
+
+  assert.equal(rowsToCsv([], ['a', 'b']), 'a,b\r\n', 'header only for no rows');
+  assert.equal(
+    rowsToCsv([{ a: 1 }], [{ key: 'a', header: 'A Header' }]),
+    'A Header\r\n1\r\n',
+    'column objects may supply a custom header',
+  );
+});
+
+/** Reports + settings + payroll routes registered together for integration tests. */
+async function setupReports(role = 'hr') {
+  // Dynamic imports keep the other API tests loadable during RED, while these
+  // Task 10 modules do not exist yet. Only the Task 10 tests should fail first.
+  const { registerReportRoutes } = await import('../api/reports.js');
+  const { registerSettingsRoutes } = await import('../api/settings.js');
+  const { registerPayrollRoutes } = await import('../api/payroll.js');
+  const db = makeDb();
+  const server = startServer({
+    db,
+    registerRoutes: (router) => {
+      registerReportRoutes(router);
+      registerSettingsRoutes(router);
+      registerPayrollRoutes(router);
+    },
+  });
+  await listen(server);
+  const client = makeClient(server);
+  if (role) {
+    const login = await client.post('/api/auth/login', { username: role, password: 'admin123' });
+    assert.equal(login.status, 200, `login as ${role} should succeed`);
+  }
+  return {
+    db,
+    server,
+    client,
+    makeClient: () => makeClient(server),
+    close: async () => {
+      await close(server);
+      db.close();
+    },
+  };
+}
+
+test('GET /api/reports/dashboard reflects seeded and newly created data', async () => {
+  const h = await setupReports('hr');
+  try {
+    const day = '2026-06-15';
+    const month = 6;
+    const year = 2026;
+    insertRow(h.db, 'employees', {
+      code: 'EMP200', name: 'New Hire', joining_date: '2026-01-01', status: 'active',
+      basic: 10000, hra: 2000, allowances: 500,
+    });
+    insertRow(h.db, 'attendance', { employee_id: 1, date: day, status: 'Present', worked_minutes: 480 });
+    insertRow(h.db, 'attendance', { employee_id: 2, date: day, status: 'Half-day', worked_minutes: 240 });
+    insertRow(h.db, 'attendance', { employee_id: 3, date: day, status: 'Absent', worked_minutes: 0 });
+    insertRow(h.db, 'leave_requests', {
+      employee_id: 1, leave_type_id: 1, from_date: day, to_date: day, days: 1, status: 'pending',
+    });
+    insertRow(h.db, 'expenses', { employee_id: 1, category: 'Travel', amount: 500, status: 'pending' });
+    insertRow(h.db, 'payslips', { employee_id: 1, month, year, gross: 37000, net: 30000, status: 'draft' });
+    insertRow(h.db, 'payslips', { employee_id: 2, month, year, gross: 30000, net: 25000, status: 'draft' });
+    insertRow(h.db, 'tasks', { title: 'Open 1', status: 'open' });
+    insertRow(h.db, 'tasks', { title: 'Open 2', status: 'in_progress' });
+    insertRow(h.db, 'tasks', { title: 'Done', status: 'done' });
+    const assetA = insertRow(h.db, 'assets', { name: 'Laptop' });
+    insertRow(h.db, 'assets', { name: 'Monitor' });
+    insertRow(h.db, 'asset_assignments', { asset_id: assetA, employee_id: 1, status: 'assigned' });
+
+    const res = await h.client.get(`/api/reports/dashboard?date=${day}&month=${month}&year=${year}`);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.headcount, 4, 'three seeded plus one created active employee');
+    assert.equal(res.body.todayAttendance, 2, 'present + half-day recorded today');
+    assert.equal(res.body.attendance.present, 1);
+    assert.equal(res.body.attendance.half_day, 1);
+    assert.equal(res.body.attendance.absent, 1);
+    assert.equal(res.body.pendingLeaves, 1);
+    assert.equal(res.body.pendingExpenses, 1);
+    assert.equal(res.body.monthlyPayrollCost, 55000, 'sum of the month payslip nets');
+    assert.equal(res.body.openTasks, 2, 'open + in_progress, not done');
+    assert.equal(res.body.assets.total, 2);
+    assert.equal(res.body.assets.assigned, 1);
+    assert.equal(res.body.assets.utilizationPercent, 50);
+  } finally {
+    await h.close();
+  }
+});
+
+test('attendance report aggregates by employee, supports filters and CSV export', async () => {
+  const h = await setupReports('hr');
+  try {
+    insertRow(h.db, 'attendance', { employee_id: 1, date: '2026-01-05', status: 'Present', worked_minutes: 480, overtime_minutes: 60 });
+    insertRow(h.db, 'attendance', { employee_id: 1, date: '2026-01-06', status: 'Half-day', worked_minutes: 240 });
+    insertRow(h.db, 'attendance', { employee_id: 2, date: '2026-01-05', status: 'Absent', worked_minutes: 0 });
+    insertRow(h.db, 'attendance', { employee_id: 3, date: '2026-02-05', status: 'Present', worked_minutes: 480 });
+
+    const res = await h.client.get('/api/reports/attendance?month=1&year=2026');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.month, 1);
+    assert.equal(res.body.year, 2026);
+    assert.equal(res.body.employees.length, 2, 'February row is excluded');
+    const emp1 = res.body.employees.find((e) => e.employee_id === 1);
+    assert.equal(emp1.present, 1);
+    assert.equal(emp1.half_day, 1);
+    assert.equal(emp1.present_days, 1.5);
+    assert.equal(emp1.overtime_minutes, 60);
+    assert.equal(res.body.totals.present, 1);
+    assert.equal(res.body.totals.absent, 1);
+
+    const filtered = await h.client.get('/api/reports/attendance?month=1&year=2026&employeeId=2');
+    assert.equal(filtered.body.employees.length, 1);
+    assert.equal(filtered.body.employees[0].employee_id, 2);
+
+    const csv = await h.client.get('/api/reports/attendance?month=1&year=2026&format=csv');
+    assert.equal(csv.status, 200);
+    assert.match(csv.headers.get('content-type'), /text\/csv/i);
+    assert.match(csv.text, /employee_id,employee_name/);
+    assert.match(csv.text, /Aarav Sharma/);
+    assert.match(csv.text, /1\.5/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('leave balance report lists balances with names, filters and exports CSV', async () => {
+  const h = await setupReports('hr');
+  try {
+    const res = await h.client.get('/api/reports/leave');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.balances.length, 12, '3 employees x 4 leave types');
+    const casual = res.body.balances.find((b) => b.employee_id === 1 && b.leave_type === 'Casual');
+    assert.equal(casual.opening_balance, 12);
+    assert.equal(casual.remaining, 12);
+    assert.equal(casual.employee_name, 'Aarav Sharma');
+
+    const filtered = await h.client.get('/api/reports/leave?employeeId=2&leaveTypeId=4');
+    assert.equal(filtered.body.balances.length, 1);
+    assert.equal(filtered.body.balances[0].leave_type, 'Unpaid');
+
+    const csv = await h.client.get('/api/reports/leave?format=csv');
+    assert.match(csv.headers.get('content-type'), /text\/csv/i);
+    assert.match(csv.text, /employee_id,employee_name,leave_type/);
+    assert.match(csv.text, /Aarav Sharma/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('payroll report reads stored payslips (no recompute) and exports CSV', async () => {
+  const h = await setupReports('hr');
+  try {
+    const run = await h.client.post('/api/payroll/run', { month: 3, year: 2026 });
+    assert.equal(run.status, 200, JSON.stringify(run.body));
+    const slips = run.body.slips;
+    const first = slips.find((s) => s.employee_id === 1);
+    assert.equal(first.pf, 1800, '12% of the 15000 PF ceiling');
+
+    const res = await h.client.get('/api/reports/payroll?month=3&year=2026');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.slips.length, 3);
+    assert.equal(res.body.totals.net, slips.reduce((sum, s) => sum + s.net, 0));
+    const withName = res.body.slips.find((s) => s.employee_id === 1);
+    assert.equal(withName.employee_name, 'Aarav Sharma');
+    assert.equal(withName.pf, first.pf, 'report reuses stored payslip values');
+
+    const csv = await h.client.get('/api/reports/payroll?month=3&year=2026&format=csv');
+    assert.match(csv.headers.get('content-type'), /text\/csv/i);
+    assert.match(csv.text, /payslip_id,employee_id,employee_name/);
+    assert.match(csv.text, /TOTAL/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('expense report summarizes claims, filters and exports CSV', async () => {
+  const h = await setupReports('hr');
+  try {
+    insertRow(h.db, 'expenses', { employee_id: 1, category: 'Travel', amount: 1200, status: 'approved', reimbursement_month: 4, reimbursement_year: 2026 });
+    insertRow(h.db, 'expenses', { employee_id: 2, category: 'Meals', amount: 300, status: 'pending' });
+
+    const res = await h.client.get('/api/reports/expenses');
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.expenses.length, 2);
+    assert.equal(res.body.summary.pending.count, 1);
+    assert.equal(res.body.summary.approved.count, 1);
+    assert.equal(res.body.summary.approved.amount, 1200);
+
+    const filtered = await h.client.get('/api/reports/expenses?status=pending');
+    assert.equal(filtered.body.expenses.length, 1);
+
+    const byMonth = await h.client.get('/api/reports/expenses?month=4&year=2026');
+    assert.equal(byMonth.body.expenses.length, 1);
+    assert.equal(byMonth.body.expenses[0].category, 'Travel');
+
+    const csv = await h.client.get('/api/reports/expenses?format=csv');
+    assert.match(csv.headers.get('content-type'), /text\/csv/i);
+    assert.match(csv.text, /id,employee_id,employee_name,category,amount,status/);
+    assert.match(csv.text, /Aarav Sharma/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET/PATCH /api/settings operates on the 18 real keys', async () => {
+  const h = await setupReports('hr');
+  try {
+    const get = await h.client.get('/api/settings');
+    assert.equal(get.status, 200, JSON.stringify(get.body));
+    assert.equal(Object.keys(get.body).length, 18);
+    assert.equal(get.body.company_name, 'HRMS Demo');
+    assert.equal(get.body.pf_rate, '12');
+    assert.equal(get.body.currency, 'INR');
+
+    const patched = await h.client.patch('/api/settings', { pf_rate: 0, company_name: 'Acme HR' });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+    assert.equal(patched.body.pf_rate, '0');
+    assert.equal(patched.body.company_name, 'Acme HR');
+    const after = await h.client.get('/api/settings');
+    assert.equal(after.body.pf_rate, '0');
+    assert.equal(after.body.currency, 'INR', 'unrelated keys are preserved');
+
+    assert.equal((await h.client.patch('/api/settings', { bogus: 'x' })).status, 400, 'unknown key');
+    assert.equal((await h.client.patch('/api/settings', { pf_rate: -1 })).status, 400, 'negative rate');
+    assert.equal((await h.client.patch('/api/settings', { settings: { currency: 'INR' } })).status, 200);
+    assert.equal((await h.client.patch('/api/settings', { key: 'locale', value: 'en-IN' })).status, 200);
+    const final = await h.client.get('/api/settings');
+    assert.equal(final.body.pf_rate, '0', 'rejected patches did not write');
+  } finally {
+    await h.close();
+  }
+});
+
+test('HR manages holidays: create, list, duplicate/invalid rejected, delete', async () => {
+  const h = await setupReports('hr');
+  try {
+    const created = await h.client.post('/api/settings/holidays', { date: '2026-01-26', name: 'Republic Day' });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(created.body.date, '2026-01-26');
+    assert.equal(created.body.name, 'Republic Day');
+
+    const listed = await h.client.get('/api/settings/holidays');
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.length, 1);
+    assert.equal(listed.body[0].name, 'Republic Day');
+
+    assert.equal((await h.client.post('/api/settings/holidays', { date: '2026-01-26', name: 'Dup' })).status, 409);
+    assert.equal((await h.client.post('/api/settings/holidays', { date: '2026-02-30', name: 'Bad' })).status, 400);
+    assert.equal((await h.client.post('/api/settings/holidays', { name: 'No date' })).status, 400);
+
+    const removed = await h.client.delete(`/api/settings/holidays/${created.body.id}`);
+    assert.equal(removed.status, 200);
+    assert.equal((await h.client.get('/api/settings/holidays')).body.length, 0);
+    assert.equal((await h.client.delete(`/api/settings/holidays/${created.body.id}`)).status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test('reports are readable by all roles; settings and holidays are HR/admin only', async () => {
+  const h = await setupReports('employee');
+  try {
+    for (const path of [
+      '/api/reports/dashboard',
+      '/api/reports/attendance?month=1&year=2026',
+      '/api/reports/leave',
+      '/api/reports/payroll?month=1&year=2026',
+      '/api/reports/expenses',
+    ]) {
+      const res = await h.client.get(path);
+      assert.equal(res.status, 200, `${path} → ${JSON.stringify(res.body)}`);
+    }
+    assert.equal((await h.client.get('/api/settings')).status, 403);
+    assert.equal((await h.client.patch('/api/settings', { pf_rate: 0 })).status, 403);
+    assert.equal((await h.client.get('/api/settings/holidays')).status, 403);
+    assert.equal((await h.client.post('/api/settings/holidays', { date: '2026-01-01' })).status, 403);
+    assert.equal((await h.client.delete('/api/settings/holidays/1')).status, 403);
+
+    const admin = await loginAs(h, 'admin');
+    assert.equal((await admin.get('/api/settings')).status, 200);
+    assert.equal((await admin.get('/api/settings/holidays')).status, 200);
+  } finally {
+    await h.close();
+  }
+
+  const anonymous = await setupReports(null);
+  try {
+    assert.equal((await anonymous.client.get('/api/reports/dashboard')).status, 401);
+    assert.equal((await anonymous.client.get('/api/settings')).status, 401);
+  } finally {
+    await anonymous.close();
+  }
+});
+
+test('employee-scoped reports only expose the signed-in employee rows', async () => {
+  const h = await setupReports('employee');
+  try {
+    insertRow(h.db, 'expenses', { employee_id: 3, category: 'Meals', amount: 100, status: 'pending' });
+    insertRow(h.db, 'expenses', { employee_id: 1, category: 'Travel', amount: 900, status: 'pending' });
+    insertRow(h.db, 'leave_requests', { employee_id: 3, leave_type_id: 1, from_date: '2026-01-01', to_date: '2026-01-01', days: 1, status: 'pending' });
+    insertRow(h.db, 'leave_requests', { employee_id: 1, leave_type_id: 1, from_date: '2026-01-01', to_date: '2026-01-01', days: 1, status: 'pending' });
+
+    const expenses = await h.client.get('/api/reports/expenses');
+    assert.equal(expenses.body.expenses.length, 1);
+    assert.equal(expenses.body.expenses[0].employee_id, 3);
+    assert.equal(expenses.body.summary.pending.amount, 100);
+
+    const dashboard = await h.client.get('/api/reports/dashboard');
+    assert.equal(dashboard.body.pendingExpenses, 1);
+    assert.equal(dashboard.body.pendingLeaves, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test('changing pf_rate via PATCH /api/settings changes the next payroll run (Task 6 integration)', async () => {
+  const h = await setupReports('hr');
+  try {
+    const first = await h.client.post('/api/payroll/run', { month: 5, year: 2026 });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    const before = first.body.slips.find((s) => s.employee_id === 1).pf;
+    assert.equal(before, 1800, '12% of the 15000 PF ceiling');
+
+    const patched = await h.client.patch('/api/settings', { pf_rate: 0 });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+
+    const second = await h.client.post('/api/payroll/run', { month: 5, year: 2026 });
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    const after = second.body.slips.find((s) => s.employee_id === 1).pf;
+    assert.equal(after, 0, 'the next run reads the updated rate from settings');
+    assert.equal(second.body.updated, 3, 'draft slips are updated, not duplicated');
+    assert.equal((await h.client.get('/api/payroll/slips?month=5&year=2026')).body.length, 3);
+  } finally {
+    await h.close();
+  }
+});
