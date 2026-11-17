@@ -107,10 +107,36 @@ function badge(value) {
   return el('span', { class: `badge ${tone}`, text });
 }
 
+/**
+ * Build a POST/filter payload: blanks are omitted so optional inputs do not
+ * send invalid empty values to create/filter endpoints.
+ */
 function cleanPayload(data) {
   const out = {};
   for (const [key, value] of Object.entries(data)) {
     if (value === '' || value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Build a PATCH payload. PATCH semantics differ: an omitted key means
+ * "unchanged", so intentionally blank optional text MUST be sent as '' to let
+ * the server clear it. `keepBlank` names text fields whose '' is preserved;
+ * `blankToZero` names numeric fields whose blank input clears them to 0.
+ * Everything else (null/undefined/blank) stays omitted.
+ */
+function patchPayload(data, { keepBlank = [], blankToZero = [] } = {}) {
+  const keep = new Set(keepBlank);
+  const zero = new Set(blankToZero);
+  const out = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value === null || value === undefined) {
+      if (zero.has(key)) out[key] = 0;
+      continue;
+    }
+    if (value === '' && !keep.has(key)) continue;
     out[key] = value;
   }
   return out;
@@ -515,7 +541,10 @@ async function screenEmployees() {
     { key: 'actions', label: 'Actions', render: (r) => el('div', { class: 'row-actions' },
       el('button', { class: 'btn small', text: 'Edit', onClick: () => {
         const modal = openModal(`Edit ${r.name}`, createForm(employeeFields(r), 'Save changes', async (data) => {
-          await api(`/api/employees/${r.id}`, { method: 'PATCH', body: cleanPayload(data) });
+          await api(`/api/employees/${r.id}`, {
+            method: 'PATCH',
+            body: patchPayload(data, { keepBlank: ['email', 'phone', 'bank_account'] }),
+          });
           modal.close();
         }, { successMessage: 'Employee updated' }));
       } }),
@@ -664,9 +693,10 @@ async function screenLeave() {
     { key: 'days', label: 'Days' },
     { key: 'reason', label: 'Reason' },
     { key: 'status', label: 'Status', render: (r) => badge(r.status) },
-    { key: 'actions', label: 'Decision', render: (r) => el('div', { class: 'row-actions' },
+    // The decision endpoint is HR_ROLES only; never offer it to employees.
+    ...(isHr() ? [{ key: 'actions', label: 'Decision', render: (r) => el('div', { class: 'row-actions' },
       r.status === 'pending' ? decide(r.id, 'approve', 'Approve', 'ok') : null,
-      (r.status === 'pending' || r.status === 'approved') ? decide(r.id, 'reject', 'Reject', 'danger') : null) },
+      (r.status === 'pending' || r.status === 'approved') ? decide(r.id, 'reject', 'Reject', 'danger') : null) }] : []),
   ];
 
   const requestHost = el('div');
@@ -735,7 +765,10 @@ async function screenPayroll() {
       value: slip[key] ?? slip[key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)] ?? 0,
     }));
     const modal = openModal('Edit draft payslip', createForm(fields, 'Save components', async (data) => {
-      await api(`/api/payroll/slips/${slip.id}`, { method: 'PATCH', body: cleanPayload(data) });
+      await api(`/api/payroll/slips/${slip.id}`, {
+        method: 'PATCH',
+        body: patchPayload(data, { blankToZero: fields.map((f) => f.name) }),
+      });
       modal.close();
     }, { successMessage: 'Payslip updated' }));
   };
@@ -939,7 +972,10 @@ async function screenTasks() {
           { name: 'due_date', label: 'Due date', type: 'date', value: t.due_date },
           { name: 'priority', label: 'Priority', type: 'select', options: priorities, value: t.priority },
         ], 'Save changes', async (data) => {
-          await api(`/api/tasks/${t.id}`, { method: 'PATCH', body: cleanPayload(data) });
+          await api(`/api/tasks/${t.id}`, {
+            method: 'PATCH',
+            body: patchPayload(data, { keepBlank: ['description'] }),
+          });
           modal.close();
         }, { successMessage: 'Task updated' }));
       } }) : null,
@@ -1019,7 +1055,10 @@ async function screenAssets() {
           { name: 'purchase_date', label: 'Purchase date', type: 'date', value: r.purchase_date },
           { name: 'value', label: 'Value', type: 'number', min: 0, step: 1, value: r.value },
         ], 'Save changes', async (data) => {
-          await api(`/api/assets/${r.id}`, { method: 'PATCH', body: cleanPayload(data) });
+          await api(`/api/assets/${r.id}`, {
+            method: 'PATCH',
+            body: patchPayload(data, { keepBlank: ['type', 'serial'] }),
+          });
           modal.close();
         }, { successMessage: 'Asset updated' }));
       } }),
@@ -1154,9 +1193,24 @@ async function screenSettings() {
   const settingPanels = groups.map(([title, groupKeys]) =>
     panel(title, [createForm(groupKeys.map(fieldFor), 'Save section', async (data) => {
       const payload = {};
+      const skipped = [];
       for (const [key, value] of Object.entries(data)) {
-        payload[key] = numericKeys.has(key) ? Number(value) : value;
+        if (!numericKeys.has(key)) {
+          payload[key] = value;
+          continue;
+        }
+        // A blank number input is collected as null; Number(null) === 0, which
+        // would silently persist a zero rate. Never send blank numerics.
+        if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) {
+          skipped.push(titleCase(key));
+          continue;
+        }
+        payload[key] = Number(value);
       }
+      if (skipped.length > 0) {
+        toast(`Skipped blank/invalid numeric fields: ${skipped.join(', ')}`, 'error');
+      }
+      if (Object.keys(payload).length === 0) return;
       await api('/api/settings', { method: 'PATCH', body: payload });
       Object.assign(settings, payload);
     }, { successMessage: `${title} saved` })]));
