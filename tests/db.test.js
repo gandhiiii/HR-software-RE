@@ -5,10 +5,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, TABLES, DATA_PATH, SEED_ADMIN } from '../lib/db.js';
 
+// Literal expected names — independent of lib/db.js's SCHEMA/TABLES, so
+// deleting a table from the schema cannot make this test pass.
+const EXPECTED_TABLES = [
+  'asset_assignments', 'assets', 'attendance', 'departments', 'designations',
+  'employees', 'expenses', 'holidays', 'leave_balances', 'leave_requests',
+  'leave_types', 'payroll_runs', 'payslips', 'settings', 'shifts',
+  'task_comments', 'tasks', 'users',
+];
+
 test('creates all tables and seeds admin once', () => {
   const db = openDatabase({ path: ':memory:', seed: true });
-  for (const t of TABLES) {
-    assert.ok(db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get() !== undefined || t);
+  assert.deepEqual([...TABLES].sort(), EXPECTED_TABLES);
+  for (const t of EXPECTED_TABLES) {
+    assert.doesNotThrow(() => db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get());
   }
   assert.equal(db.prepare('SELECT count(*) n FROM users').get().n, 3);
   db.close();
