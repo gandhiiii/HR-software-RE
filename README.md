@@ -166,3 +166,15 @@ The suite covers database/seed, validation, repository helpers, auth and
 router behaviour, every API module, static UI serving, and the full end-to-end
 walkthrough. All tests use fresh in-memory databases and ephemeral ports, so
 they never touch `data/hrms.db` or port 3000.
+
+### Browser acceptance check
+
+The UI was also verified in a real headless Chrome (CDP) against a live
+`node server.js`: the login screen rendered with `#app` populated and a login
+form, signing in navigated to `#/dashboard`, and the dashboard rendered its
+full sidebar and live KPI cards. No uncaught page errors occurred. The only
+console messages were the browser's note for the expected unauthenticated
+`GET /api/auth/me` probe (a handled 401 that selects the login screen) and a
+Chrome advisory suggesting an `autocomplete` attribute on the password input;
+neither is a runtime error. Screenshots and console/CDP evidence IDs are
+recorded in `.superpowers/sdd/hrms-plan/task-12-report.md`.
