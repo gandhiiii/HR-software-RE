@@ -509,3 +509,52 @@ test('GET /api/expenses is own-only for employees and filterable for HR', async 
     await h.close();
   }
 });
+
+test('an explicitly invalid employeeId on submit is 400 (submit agrees with list)', async () => {
+  const h = await setupExpenses('hr');
+  try {
+    // An explicitly supplied id must be a positive integer. Silently falling
+    // back to the caller's own id would misattribute the claim and hide the
+    // bad input, while GET already 400s the same values.
+    for (const employeeId of ['abc', 0, -1, true, [1], null]) {
+      const res = await h.client.post('/api/expenses', {
+        employeeId,
+        category: 'Travel',
+        amount: 1200,
+      });
+      assert.equal(
+        res.status,
+        400,
+        `employeeId ${JSON.stringify(employeeId)} → ${JSON.stringify(res.body)}`,
+      );
+      assert.match(res.body.error, /employeeId/i);
+    }
+    assert.equal((await h.client.get('/api/expenses')).body.length, 0);
+
+    // Valid numeric and numeric-string ids still work for HR/admin.
+    const numeric = await h.client.post('/api/expenses', {
+      employeeId: 1,
+      category: 'Travel',
+      amount: 100,
+    });
+    assert.equal(numeric.status, 201, JSON.stringify(numeric.body));
+    assert.equal(numeric.body.employee_id, 1);
+
+    const asString = await h.client.post('/api/expenses', {
+      employeeId: '3',
+      category: 'Meals',
+      amount: 200,
+    });
+    assert.equal(asString.status, 201, JSON.stringify(asString.body));
+    assert.equal(asString.body.employee_id, 3);
+
+    // Omitting employeeId still falls back to the caller's own linked employee.
+    const fallback = await h.client.post('/api/expenses', { category: 'Travel', amount: 50 });
+    assert.equal(fallback.status, 201, JSON.stringify(fallback.body));
+    assert.equal(fallback.body.employee_id, 2);
+
+    assert.equal((await h.client.get('/api/expenses')).body.length, 3);
+  } finally {
+    await h.close();
+  }
+});

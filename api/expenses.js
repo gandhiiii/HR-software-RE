@@ -22,6 +22,10 @@ function httpError(status, message) {
 }
 
 function positiveId(value) {
+  // Only real numbers or numeric strings may identify a row. Coercing via
+  // Number() alone would accept booleans (true -> 1) and arrays ([1] -> 1),
+  // letting type-confused input silently land on an unrelated employee.
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
   const id = Number(value);
   return Number.isInteger(id) && id > 0 ? id : null;
 }
@@ -91,7 +95,14 @@ function submitExpense(db, body, user) {
   if (user.role === 'employee') {
     employeeId = ownEmployeeId(user);
   } else {
-    employeeId = positiveId(body.employeeId) ?? positiveId(user?.employee_id);
+    // An explicitly supplied employeeId is authoritative: validate it with the
+    // same rule GET uses and never silently replace a bad value with our own
+    // id. Only when it is omitted do we fall back to the caller's own employee.
+    if (body.employeeId !== undefined && body.employeeId !== '') {
+      employeeId = positiveId(body.employeeId);
+    } else {
+      employeeId = positiveId(user?.employee_id);
+    }
     if (employeeId === null) throw httpError(400, 'employeeId must be a positive integer');
   }
   if (!getRow(db, 'employees', employeeId)) throw httpError(404, 'Employee not found');
