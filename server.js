@@ -11,18 +11,27 @@ import { pathToFileURL } from 'node:url';
 import { openDatabase } from './lib/db.js';
 import { createRouter } from './lib/router.js';
 import { registerAuthRoutes } from './lib/auth.js';
+import { sendJson } from './lib/http.js';
 
 const HOST = '127.0.0.1';
 const PORT = 3000;
 
 /**
+ * Build the HRMS server. IMPORTANT: this function does NOT listen on a port.
+ * Callers must call `server.listen(...)` themselves — API tests use
+ * `server.listen(0)` so `makeClient` can pick an ephemeral port. `port` and
+ * `host` are metadata only: they are stored on `server.bindAddress` for the
+ * CLI main guard below, which is what satisfies the one-command `node server.js`
+ * start. They never trigger a listen call inside this function.
+ *
  * @param {object} options
  * @param {import('node:sqlite').DatabaseSync} options.db database from lib/db.js
- * @param {number} [options.port=3000] default port (used by the main guard)
- * @param {string} [options.host='127.0.0.1'] default host
+ * @param {number} [options.port=3000] metadata port (used by the CLI main guard)
+ * @param {string} [options.host='127.0.0.1'] metadata host (CLI main guard)
  * @param {(router: object) => void} [options.registerRoutes] hook for later
  *   tasks to add their own routes to the same router
- * @returns {import('node:http').Server} an http.Server that is not yet listening
+ * @returns {import('node:http').Server} an http.Server that is NOT listening;
+ *   its `bindAddress` is `{port, host}` metadata and `router` is the live router
  */
 export function startServer({ db, port = PORT, host = HOST, registerRoutes } = {}) {
   if (!db) throw new TypeError('startServer requires a db');
@@ -31,7 +40,13 @@ export function startServer({ db, port = PORT, host = HOST, registerRoutes } = {
   registerAuthRoutes(router);
   if (typeof registerRoutes === 'function') registerRoutes(router);
 
-  const server = http.createServer((req, res) => router.handle(req, res, { db }));
+  const server = http.createServer((req, res) => {
+    router.handle(req, res, { db }).catch((error) => {
+      // Defensive backstop: router.handle already converts throws to JSON 500s.
+      if (res.headersSent) return res.end();
+      sendJson(res, 500, { error: error?.message ?? 'Internal server error' });
+    });
+  });
   server.bindAddress = { port, host };
   // Exposed so later tasks can register additional routes onto a live server.
   server.router = router;

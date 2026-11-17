@@ -243,6 +243,48 @@ test('later tasks can register routes via the hook or onto server.router', async
   }
 });
 
+test('startServer is non-listening; port/host are metadata only', () => {
+  const db = makeDb();
+  try {
+    const custom = startServer({ db, port: 4321, host: '127.0.0.1' });
+    assert.equal(custom.listening, false);
+    assert.deepEqual(custom.bindAddress, { port: 4321, host: '127.0.0.1' });
+
+    const defaults = startServer({ db });
+    assert.equal(defaults.listening, false);
+    assert.deepEqual(defaults.bindAddress, { port: 3000, host: '127.0.0.1' });
+  } finally {
+    db.close();
+  }
+});
+
+test('a DB error during session lookup yields 500 and does not crash the server', async () => {
+  const db = makeDb();
+  const server = startServer({ db });
+  await listen(server);
+  const client = makeClient(server);
+  try {
+    const admin = db.prepare('SELECT id FROM users WHERE role = ?').get('admin');
+    const token = createSession(admin.id);
+    // Break the users table so resolveUser's db.prepare throws outside the
+    // route handler's own try/catch. The router's outer catch must handle it.
+    db.exec('DROP TABLE users');
+
+    const failed = await client.get('/api/auth/me', {
+      headers: { cookie: `hrms_session=${token}` },
+    });
+    assert.equal(failed.status, 500);
+    assert.ok(failed.body.error);
+
+    // No cookie => no DB lookup => the server is demonstrably still alive.
+    const stillAlive = await client.get('/api/auth/me');
+    assert.equal(stillAlive.status, 401);
+  } finally {
+    await close(server);
+    db.close();
+  }
+});
+
 test('readJsonBody cap and handler errors return {error} with the right status', async () => {
   const router = createRouter();
   router.register('POST', '/api/echo', ['admin'], async ({ body }) => ({
