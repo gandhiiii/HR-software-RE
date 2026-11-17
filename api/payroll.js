@@ -309,10 +309,44 @@ function markExpensesReimbursed(db, slip) {
   }
 }
 
+/**
+ * A flagged expense may only become "reimbursed" once a payslip actually funds
+ * it: the reimbursement component is written by a payroll RUN. Locking a slip
+ * after flagging an expense without re-running would otherwise mark the claim
+ * reimbursed while the slip still shows zero reimbursement — the employee never
+ * receives the money, silently. Check before any write so a rejected guard
+ * leaves both the slip and the expenses exactly as they were.
+ *
+ * For a FINALIZED slip the originally funded expenses were already moved to
+ * "reimbursed" at finalize time, so any still-approved flagged expense appeared
+ * afterwards and is unfunded; none may be marked here.
+ */
+function assertExpensesFunded(db, slip) {
+  const flagged = flaggedExpensesForMonth(db, slip.employee_id, slip.month, slip.year);
+  const outstanding = roundRupee(
+    flagged.reduce((total, expense) => total + Number(expense.amount ?? 0), 0),
+  );
+  if (slip.status === DRAFT) {
+    const funded = roundRupee(Number(slip.reimbursement ?? 0));
+    if (outstanding !== funded) {
+      throw httpError(
+        409,
+        `Flagged expenses (${outstanding}) are not included in this payslip's reimbursement (${funded}); re-run payroll before finalizing or paying`,
+      );
+    }
+  } else if (outstanding !== 0) {
+    throw httpError(
+      409,
+      `New expenses (${outstanding}) were flagged after this payslip was finalized; re-run payroll before paying`,
+    );
+  }
+}
+
 function finalizeSlip(db, id) {
   const slip = getRow(db, 'payslips', id);
   if (!slip) throw httpError(404, 'Payslip not found');
   if (slip.status !== DRAFT) throw httpError(409, 'Only draft payslips can be finalized');
+  assertExpensesFunded(db, slip);
   updateRow(db, 'payslips', id, { status: FINALIZED });
   markExpensesReimbursed(db, slip);
   return { status: 200, body: getRow(db, 'payslips', id) };
@@ -322,6 +356,7 @@ function paySlip(db, id) {
   const slip = getRow(db, 'payslips', id);
   if (!slip) throw httpError(404, 'Payslip not found');
   if (slip.status === PAID) throw httpError(409, 'Payslip is already marked paid');
+  assertExpensesFunded(db, slip);
   updateRow(db, 'payslips', id, { status: PAID });
   markExpensesReimbursed(db, slip);
   return { status: 200, body: getRow(db, 'payslips', id) };

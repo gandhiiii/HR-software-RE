@@ -154,6 +154,18 @@ or paying a slip moves that month's flagged, approved expenses to `reimbursed`.
 - Dependencies are intentionally limited to Node.js built-ins; there is no build
   step, bundler, transpiler, or TypeScript.
 
+### Known simplifications
+
+- **Cross-month leave is not prorated.** Payroll counts the full `days` value of
+  every approved unpaid-leave request that overlaps the payroll month. A single
+  request spanning two months therefore contributes its full day count to each
+  month's unpaid-leave deduction rather than being split between them.
+- **The CSV formula guard also protects values starting with `-`.** The shared
+  CSV writer prefixes any cell beginning with `=`, `+`, `-`, `@`, tab or CR with
+  an apostrophe to neutralise spreadsheet formula injection. Since `-` is on
+  that list, a negative numeric value is exported as text (for example `'-500`)
+  rather than as a spreadsheet number.
+
 ## Tests
 
 From this directory:

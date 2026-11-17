@@ -270,6 +270,46 @@ test('approved unpaid leave and flagged expenses feed the payslip; finalize mark
   }
 });
 
+test('run -> flag -> finalize without a re-run is rejected with 409 and changes nothing', async () => {
+  const h = await setup('hr');
+  try {
+    // Run first: the slip is drafted with no reimbursement component.
+    const run = await runMonth(h.client);
+    const slip = run.slips.find((s) => s.employee_id === 1);
+    assert.equal(slip.reimbursement, 0);
+
+    // Then flag an approved expense for that month, but do NOT re-run payroll.
+    const expenseId = addFlaggedExpense(h.db, 1, 1200);
+
+    const finalize = await h.client.post(`/api/payroll/slips/${slip.id}/finalize`, {});
+    assert.equal(finalize.status, 409, JSON.stringify(finalize.body));
+    assert.match(finalize.body.error, /re-run payroll/i);
+
+    const pay = await h.client.post(`/api/payroll/slips/${slip.id}/pay`, {});
+    assert.equal(pay.status, 409, JSON.stringify(pay.body));
+    assert.match(pay.body.error, /re-run payroll/i);
+
+    // The failed attempts must not mark the expense reimbursed or lock the slip.
+    const expense = getRow(h.db, 'expenses', expenseId);
+    assert.equal(expense.status, 'approved');
+    assert.equal(expense.reimbursement_month, 1);
+    assert.equal(expense.reimbursement_year, 2026);
+    const stored = getRow(h.db, 'payslips', slip.id);
+    assert.equal(stored.status, 'draft');
+    assert.equal(stored.reimbursement, 0);
+
+    // Re-running funds the expense; finalizing now succeeds and reimburses it.
+    const rerun = await runMonth(h.client);
+    const funded = rerun.slips.find((s) => s.employee_id === 1);
+    assert.equal(funded.reimbursement, 1200);
+    const finalized = await h.client.post(`/api/payroll/slips/${funded.id}/finalize`, {});
+    assert.equal(finalized.status, 200, JSON.stringify(finalized.body));
+    assert.equal(getRow(h.db, 'expenses', expenseId).status, 'reimbursed');
+  } finally {
+    await h.close();
+  }
+});
+
 test('draft component edits recompute totals; finalized and paid slips reject edits with 409', async () => {
   const h = await setup('hr');
   try {
