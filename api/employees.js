@@ -28,6 +28,9 @@ const EMPLOYEE_FIELDS = [
   'bank_account',
 ];
 const MONEY_FIELDS = ['basic', 'hra', 'allowances'];
+// `status` is TEXT NOT NULL in the schema; null/blank/invalid values must be
+// rejected here rather than becoming a raw SQLite 500 (or a stored empty value).
+const EMPLOYEE_STATUSES = new Set(['active', 'inactive']);
 
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -57,6 +60,9 @@ function validateEmployeeData(data, { partial = false } = {}) {
     if (data[field] !== undefined && !isNonNegativeNumber(data[field])) {
       throw httpError(400, `${field} must be a non-negative number`);
     }
+  }
+  if (data.status !== undefined && !EMPLOYEE_STATUSES.has(data.status)) {
+    throw httpError(400, `status must be one of: ${[...EMPLOYEE_STATUSES].join(', ')}`);
   }
 }
 

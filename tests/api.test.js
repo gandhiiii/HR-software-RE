@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { registerEmployeeRoutes, registerOrgRoutes } from '../api/employees.js';
+import { insertRow } from '../lib/repo.js';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -215,6 +216,57 @@ test('DELETE /api/employees/:id removes the row', async () => {
     assert.equal(removed.status, 200);
     assert.equal(removed.body.ok, true);
     assert.equal((await h.client.get(`/api/employees/${created.id}`)).status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
+test('status null and empty string on POST are 400, not a raw SQLite 500', async () => {
+  const h = await setup('hr');
+  try {
+    for (const [code, status] of [
+      ['BAD_STATUS_NULL', null],
+      ['BAD_STATUS_EMPTY', ''],
+    ]) {
+      const response = await h.client.post('/api/employees', {
+        ...NEW_EMPLOYEE,
+        code,
+        status,
+      });
+      assert.equal(response.status, 400, JSON.stringify(response.body));
+      assert.ok(response.body.error, 'a 400 must still carry an error message');
+      assert.doesNotMatch(
+        response.body.error,
+        /no such column|has no column named|NOT NULL constraint|UNIQUE constraint|SQLITE|constraint failed/i,
+      );
+    }
+    // Neither rejected request stored a row.
+    assert.equal((await h.client.get('/api/employees')).body.length, 3);
+  } finally {
+    await h.close();
+  }
+});
+
+test('an unknown column passed to a repo helper from a handler is a clean 400', async () => {
+  const h = await setup('hr');
+  try {
+    // Routes may be added after listen(): the router holds a mutable list.
+    h.server.router.register('POST', '/api/_bad-column', ['admin', 'hr'], async ({ db }) => {
+      insertRow(db, 'employees', {
+        code: 'BAD_COLUMN',
+        name: 'Bad Column',
+        joining_date: '2026-01-01',
+        bogus_column: 'x',
+      });
+      return { status: 200, body: {} };
+    });
+
+    const response = await h.client.post('/api/_bad-column', {});
+    assert.equal(response.status, 400, JSON.stringify(response.body));
+    assert.doesNotMatch(
+      response.body.error,
+      /no such column|has no column named|SQLITE|NOT NULL constraint/i,
+    );
   } finally {
     await h.close();
   }

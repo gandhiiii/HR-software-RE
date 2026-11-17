@@ -126,3 +126,74 @@ test('repo helpers reject table names outside the whitelist', () => {
     db.close();
   }
 });
+
+test('repo helpers reject unknown columns with a 400 and no raw SQLite text', () => {
+  const db = makeDb();
+  try {
+    const assertClean400 = (error) => {
+      assert.equal(error.status, 400);
+      assert.doesNotMatch(
+        error.message,
+        /no such column|has no column named|SQLITE|NOT NULL constraint/i,
+      );
+      return true;
+    };
+    assert.throws(
+      () =>
+        insertRow(db, 'employees', {
+          code: 'EUNKNOWN',
+          name: 'Unknown Column',
+          joining_date: '2026-01-01',
+          bogus_column: 'x',
+        }),
+      assertClean400,
+    );
+    assert.throws(
+      () => updateRow(db, 'employees', 1, { bogus_column: 'x' }),
+      assertClean400,
+    );
+
+    // A valid insert still works after the rejected attempts.
+    const id = insertRow(db, 'employees', {
+      code: 'EGOOD',
+      name: 'Good Row',
+      joining_date: '2026-01-01',
+    });
+    assert.ok(id > 0);
+  } finally {
+    db.close();
+  }
+});
+
+test('repo helpers map NOT NULL violations and typo filters to 400 without SQL text', () => {
+  const db = makeDb();
+  try {
+    assert.throws(
+      () =>
+        insertRow(db, 'employees', {
+          code: 'ENULLSTATUS',
+          name: 'Null Status',
+          joining_date: '2026-01-01',
+          status: null,
+        }),
+      (error) => {
+        assert.equal(error.status, 400);
+        assert.doesNotMatch(
+          error.message,
+          /NOT NULL constraint|SQLITE|no such column|has no column named/i,
+        );
+        return true;
+      },
+    );
+    assert.throws(
+      () => listRows(db, 'employees', 'bogus_column = ?', [1]),
+      (error) => {
+        assert.equal(error.status, 400);
+        assert.doesNotMatch(error.message, /no such column|has no column named|SQLITE/i);
+        return true;
+      },
+    );
+  } finally {
+    db.close();
+  }
+});
