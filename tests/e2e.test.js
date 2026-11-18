@@ -68,6 +68,38 @@ test('GET /app.js and GET /styles.css return 200 with the right content types', 
   }
 });
 
+test('biometric screen is wired into the SPA shell and its API is HR-only', async () => {
+  const h = await setup();
+  try {
+    // The hash route is client-side: the server serves the same SPA shell at /.
+    const shell = await h.client.get('/');
+    assert.equal(shell.status, 200);
+    assert.match(shell.text, /id=["']app["']/, 'shell must contain the app mount point');
+
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    assert.match(js.text, /key: 'biometric'/, 'Biometric must be a NAV item');
+    assert.match(js.text, /\{ key: 'biometric'[^}]*roles: HR_ROLES \}/,
+      'Biometric nav must be restricted to HR roles');
+    assert.match(js.text, /biometric: screenBiometric/, 'Biometric must be registered in SCREENS');
+
+    const login = await h.client.post('/api/auth/login', { username: 'admin', password: 'admin123' });
+    assert.equal(login.status, 200);
+    const devices = await h.client.get('/api/biometric/devices');
+    assert.equal(devices.status, 200, JSON.stringify(devices.body));
+    assert.ok(Array.isArray(devices.body));
+
+    // The employee role must not reach the biometric API, mirroring the nav rule.
+    await h.client.post('/api/auth/logout', {});
+    const empLogin = await h.client.post('/api/auth/login', { username: 'employee', password: 'admin123' });
+    assert.equal(empLogin.status, 200);
+    const forbidden = await h.client.get('/api/biometric/devices');
+    assert.equal(forbidden.status, 403);
+  } finally {
+    await h.close();
+  }
+});
+
 test('unauthenticated API calls from the UI pattern still return 401', async () => {
   const h = await setup();
   try {

@@ -15,6 +15,8 @@ const ALL_ROLES = ['admin', 'hr', 'employee'];
 const HR_ROLES = ['admin', 'hr'];
 const STATE = { user: null };
 const uiPeriod = { month: new Date().getMonth() + 1, year: new Date().getFullYear() };
+// Biometric tabs are local UI state, never hash routes.
+const biometricUi = { tab: 'devices' };
 
 // ---------------------------------------------------------------------------
 // Tiny DOM / formatting helpers
@@ -250,9 +252,22 @@ function collectForm(form, fields) {
 function createForm(fields, submitLabel, onSubmit, opts = {}) {
   const form = el('form', { class: 'form-grid' });
   for (const field of fields) {
-    const label = el('label', { class: 'field', text: field.label });
+    // Radios contain several labelled inputs, so use a div instead of a label
+    // to avoid nesting <label> elements. `form.elements[name].value` still
+    // returns the checked value through collectForm().
+    const label = el(field.type === 'radio' ? 'div' : 'label', { class: 'field', text: field.label });
     let input;
-    if (field.type === 'select') {
+    if (field.type === 'radio') {
+      input = el('div', { class: 'radio-group' });
+      const current = field.value === undefined || field.value === null ? '' : String(field.value);
+      for (const option of field.options ?? []) {
+        const value = typeof option === 'object' ? option.value : option;
+        const text = typeof option === 'object' ? option.label : option;
+        input.append(el('label', { class: 'radio-option' },
+          el('input', { type: 'radio', name: field.name, value, checked: String(value) === current }),
+          el('span', { text })));
+      }
+    } else if (field.type === 'select') {
       input = selectControl(field.options ?? [], field.value);
       input.name = field.name;
       input.required = !!field.required;
@@ -312,6 +327,7 @@ const NAV = [
   { key: 'dashboard', label: 'Dashboard', glyph: '▦', roles: ALL_ROLES },
   { key: 'employees', label: 'Employees', glyph: '◉', roles: HR_ROLES },
   { key: 'attendance', label: 'Attendance', glyph: '◷', roles: ALL_ROLES },
+  { key: 'biometric', label: 'Biometric', glyph: '◉', roles: HR_ROLES },
   { key: 'leave', label: 'Leave', glyph: '✈', roles: ALL_ROLES },
   { key: 'payroll', label: 'Payroll', glyph: '₹', roles: ALL_ROLES },
   { key: 'expenses', label: 'Expenses', glyph: '▤', roles: ALL_ROLES },
@@ -325,6 +341,7 @@ const SCREENS = {
   dashboard: screenDashboard,
   employees: screenEmployees,
   attendance: screenAttendance,
+  biometric: screenBiometric,
   leave: screenLeave,
   payroll: screenPayroll,
   expenses: screenExpenses,
@@ -507,11 +524,71 @@ async function screenDashboard() {
 // ---------------------------------------------------------------------------
 
 async function screenEmployees() {
-  const [employees, departments, designations, shifts] = await Promise.all([
+  const [employees, departments, designations, shifts, devices] = await Promise.all([
     api('/api/employees'), api('/api/departments'), api('/api/designations'), api('/api/shifts'),
+    api('/api/biometric/devices'),
   ]);
+  // Biometric identity lives in biometric_employee_map — never in employees.
+  const mappingLists = await Promise.all(devices.map((d) =>
+    api(`/api/biometric/devices/${d.id}/mappings`)));
+  const mappingByEmployee = new Map();
+  devices.forEach((device, index) => {
+    for (const mapping of mappingLists[index]) {
+      mappingByEmployee.set(mapping.employee_id, { ...mapping, deviceId: device.id });
+    }
+  });
+
   const deptNames = new Map(departments.map((d) => [d.id, d.name]));
   const desigNames = new Map(designations.map((d) => [d.id, d.name]));
+  const deviceNames = new Map(devices.map((d) => [d.id, d.name]));
+  const deviceOptions = [
+    { value: '', label: 'None' },
+    ...devices.filter((d) => d.enabled !== 0 && d.enabled !== false)
+      .map((d) => ({ value: d.id, label: d.name })),
+  ];
+
+  const withBiometric = (row = {}) => {
+    const mapping = mappingByEmployee.get(row.id);
+    return {
+      ...row,
+      _source: mapping ? 'biometric' : 'mobile',
+      _biometricDeviceId: mapping ? String(mapping.deviceId) : '',
+      _biometricCode: mapping ? mapping.device_user_id : '',
+    };
+  };
+
+  /** Persist the optional device/user-id pairing through biometric_employee_map. */
+  const syncBiometricMapping = async (employeeId, data) => {
+    const source = data.attendanceSource || 'mobile';
+    const deviceId = data.biometricDeviceId;
+    const code = String(data.biometricCode ?? '').trim();
+    const existing = mappingByEmployee.get(employeeId);
+    if (source === 'mobile') {
+      if (existing) {
+        await api(`/api/biometric/devices/${existing.deviceId}/mappings/${existing.id}`, { method: 'DELETE' });
+        mappingByEmployee.delete(employeeId);
+      }
+      return;
+    }
+    if (!deviceId || !code) return; // all biometric fields are optional
+    if (existing && (String(existing.deviceId) !== String(deviceId) || existing.device_user_id !== code)) {
+      await api(`/api/biometric/devices/${existing.deviceId}/mappings/${existing.id}`, { method: 'DELETE' });
+      mappingByEmployee.delete(employeeId);
+    }
+    const created = await api(`/api/biometric/devices/${deviceId}/mappings`, {
+      method: 'POST', body: { employeeId, deviceUserId: code },
+    });
+    mappingByEmployee.set(employeeId, { ...created, deviceId: Number(deviceId) });
+  };
+
+  // A mapping problem must not hide the fact that the employee itself was saved.
+  const saveMapping = async (employeeId, data) => {
+    try {
+      await syncBiometricMapping(employeeId, data);
+    } catch (error) {
+      toast(`Biometric mapping was not saved: ${errorMessage(error)}`, 'error');
+    }
+  };
 
   const employeeFields = (row = {}) => [
     { name: 'code', label: 'Code', required: true, value: row.code },
@@ -527,6 +604,11 @@ async function screenEmployees() {
     { name: 'email', label: 'Email', type: 'email', value: row.email },
     { name: 'phone', label: 'Phone', value: row.phone },
     { name: 'bank_account', label: 'Bank account', value: row.bank_account },
+    { name: 'attendanceSource', label: 'Attendance source', type: 'radio',
+      options: [{ value: 'mobile', label: 'Mobile' }, { value: 'biometric', label: 'Biometric' }, { value: 'both', label: 'Both' }],
+      value: row._source ?? 'mobile' },
+    { name: 'biometricDeviceId', label: 'Biometric device', type: 'select', options: deviceOptions, value: row._biometricDeviceId },
+    { name: 'biometricCode', label: 'Biometric code (device user ID)', value: row._biometricCode, placeholder: 'e.g. 1001' },
   ];
 
   const columns = [
@@ -537,14 +619,23 @@ async function screenEmployees() {
     { key: 'designation_id', label: 'Designation', render: (r) => desigNames.get(r.designation_id) || '—' },
     { key: 'joining_date', label: 'Joined' },
     { key: 'status', label: 'Status', render: (r) => badge(r.status) },
+    { key: 'biometric', label: 'Biometric', render: (r) => {
+      const mapping = mappingByEmployee.get(r.id);
+      return mapping
+        ? el('div', {}, el('div', { text: deviceNames.get(mapping.deviceId) || `#${mapping.deviceId}` }),
+          el('div', { class: 'small muted', text: `User ${mapping.device_user_id}` }))
+        : el('span', { class: 'muted', text: 'Mobile' });
+    } },
     { key: 'basic', label: 'Basic', className: 'num', render: (r) => money(r.basic) },
     { key: 'actions', label: 'Actions', render: (r) => el('div', { class: 'row-actions' },
       el('button', { class: 'btn small', text: 'Edit', onClick: () => {
-        const modal = openModal(`Edit ${r.name}`, createForm(employeeFields(r), 'Save changes', async (data) => {
+        const modal = openModal(`Edit ${r.name}`, createForm(employeeFields(withBiometric(r)), 'Save changes', async (data) => {
+          const { attendanceSource, biometricDeviceId, biometricCode, ...employeeData } = data;
           await api(`/api/employees/${r.id}`, {
             method: 'PATCH',
-            body: patchPayload(data, { keepBlank: ['email', 'phone', 'bank_account'] }),
+            body: patchPayload(employeeData, { keepBlank: ['email', 'phone', 'bank_account'] }),
           });
+          await saveMapping(r.id, { attendanceSource, biometricDeviceId, biometricCode });
           modal.close();
         }, { successMessage: 'Employee updated' }));
       } }),
@@ -565,8 +656,11 @@ async function screenEmployees() {
   }, { silent: true });
 
   return screen('Employees', 'Create, search and maintain employee records.',
-    panel('Add employee', [createForm(employeeFields(), 'Add employee', async (data) =>
-      api('/api/employees', { method: 'POST', body: cleanPayload(data) }))]),
+    panel('Add employee', [createForm(employeeFields(), 'Add employee', async (data) => {
+      const { attendanceSource, biometricDeviceId, biometricCode, ...employeeData } = data;
+      const created = await api('/api/employees', { method: 'POST', body: cleanPayload(employeeData) });
+      await saveMapping(created.id, { attendanceSource, biometricDeviceId, biometricCode });
+    })]),
     panel('Filters', [filters]),
     panel('Employee directory', [tableHost]));
 }
@@ -646,6 +740,570 @@ async function screenAttendance() {
     panel('Record attendance', [recordForm]),
     panel('Attendance entries', [listFilters, listHost]),
     panel('Monthly summary', [summaryForm, summaryHost]));
+}
+
+// ---------------------------------------------------------------------------
+// Biometric (HR/admin only)
+// ---------------------------------------------------------------------------
+
+/** Keep a device's configured value visible even if it is not a common option. */
+function withCurrentOption(options, current) {
+  if (current === null || current === undefined || current === '') return options;
+  const values = options.map((o) => String(typeof o === 'object' ? o.value : o));
+  return values.includes(String(current)) ? options : [String(current), ...options];
+}
+
+async function copyToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const helper = el('textarea', { value: text });
+  helper.style.position = 'fixed';
+  helper.style.opacity = '0';
+  document.body.append(helper);
+  helper.select();
+  document.execCommand('copy');
+  helper.remove();
+}
+
+async function screenBiometric() {
+  const [devices, employees, punches, syncRuns] = await Promise.all([
+    api('/api/biometric/devices'),
+    api('/api/employees'),
+    api('/api/biometric/punches'),
+    api('/api/biometric/sync-runs'),
+  ]);
+  const pad = (n) => String(n).padStart(2, '0');
+  const deviceById = new Map(devices.map((d) => [d.id, d]));
+  const employeeById = new Map(employees.map((e) => [e.id, e]));
+  const deviceChoices = devices.map((d) => ({ value: d.id, label: d.name }));
+  const allDeviceOptions = [{ value: '', label: 'All devices' }, ...deviceChoices];
+  const selectDeviceOptions = [{ value: '', label: 'Select a device' }, ...deviceChoices];
+  const employeeChoices = employees.map((e) => ({ value: e.id, label: `${e.code} · ${e.name}` }));
+  const empName = (id) => {
+    const e = employeeById.get(Number(id));
+    return e ? `${e.code} · ${e.name}` : (id ? `Employee #${id}` : '—');
+  };
+  const devName = (id) => deviceById.get(Number(id))?.name || (id ? `Device #${id}` : '—');
+  const flag = (value) => badge(value === 1 || value === true ? 'yes' : 'no');
+
+  // ---- Devices ------------------------------------------------------------
+  const deviceFields = (row = {}) => [
+    { name: 'name', label: 'Name', required: true, value: row.name },
+    { name: 'serialNumber', label: 'Serial number', required: true, value: row.serialNumber },
+    { name: 'vendor', label: 'Vendor', value: row.vendor ?? 'generic' },
+    { name: 'model', label: 'Model', value: row.model },
+    { name: 'deviceType', label: 'Device type', value: row.deviceType ?? 'fingerprint', placeholder: 'fingerprint / face / rfid' },
+    { name: 'ipAddress', label: 'IP address', value: row.ipAddress },
+    { name: 'port', label: 'Port', type: 'number', min: 1, value: row.port },
+    { name: 'location', label: 'Location', value: row.location },
+    { name: 'ingestionMode', label: 'Ingestion mode', type: 'select',
+      options: withCurrentOption(['offline', 'push', 'poll'], row.ingestionMode), value: row.ingestionMode ?? 'offline' },
+    { name: 'adapter', label: 'Adapter', value: row.adapter ?? 'generic_json', placeholder: 'generic_json / zkteco_adms / http_json' },
+    { name: 'pollEndpoint', label: 'Poll endpoint', value: row.pollEndpoint },
+    { name: 'pollHeadersJson', label: 'Poll headers (JSON)', type: 'textarea', value: row.pollHeadersJson },
+    { name: 'pollIntervalSeconds', label: 'Poll interval (s)', type: 'number', min: 0, value: row.pollIntervalSeconds ?? 60 },
+    { name: 'autoCommit', label: 'Auto-commit pairs', type: 'checkbox', value: row.autoCommit === 1 || row.autoCommit === true },
+    { name: 'enabled', label: 'Enabled', type: 'checkbox',
+      value: row.enabled === undefined ? true : (row.enabled === 1 || row.enabled === true) },
+  ];
+
+  const deviceModal = (row) => {
+    const editing = !!row?.id;
+    const modal = openModal(editing ? `Edit device · ${row.name}` : 'Register device',
+      createForm(deviceFields(row ?? {}), editing ? 'Save changes' : 'Register device', async (data) => {
+        const payload = cleanPayload({
+          name: data.name, serialNumber: data.serialNumber, vendor: data.vendor, model: data.model,
+          deviceType: data.deviceType, ipAddress: data.ipAddress, port: data.port, location: data.location,
+          ingestionMode: data.ingestionMode, adapter: data.adapter, pollEndpoint: data.pollEndpoint,
+          pollHeadersJson: data.pollHeadersJson, pollIntervalSeconds: data.pollIntervalSeconds,
+        });
+        // Checkboxes collect false, which cleanPayload would otherwise drop on PATCH.
+        payload.autoCommit = !!data.autoCommit;
+        payload.enabled = !!data.enabled;
+        if (editing) await api(`/api/biometric/devices/${row.id}`, { method: 'PATCH', body: payload });
+        else await api('/api/biometric/devices', { method: 'POST', body: payload });
+        modal.close();
+      }, { successMessage: editing ? 'Device updated' : 'Device registered' }));
+  };
+
+  const buildDevices = () => {
+    const columns = [
+      { key: 'name', label: 'Device', render: (d) => el('div', {},
+        el('div', { text: d.name }), el('div', { class: 'small muted', text: d.serialNumber })) },
+      { key: 'vendor', label: 'Vendor / model', render: (d) => [d.vendor, d.model].filter(Boolean).join(' / ') || '—' },
+      { key: 'location' },
+      { key: 'ingestionMode', label: 'Mode', render: (d) => badge(d.ingestionMode) },
+      { key: 'adapter', label: 'Adapter', render: (d) => el('span', { class: 'small', text: d.adapter || '—' }) },
+      { key: 'enabled', label: 'Enabled', render: (d) => flag(d.enabled) },
+      { key: 'autoCommit', label: 'Auto-commit', render: (d) => flag(d.autoCommit) },
+      { key: 'lastSyncAt', label: 'Last sync' },
+      { key: 'actions', label: 'Actions', render: (d) => el('div', { class: 'row-actions' },
+        el('button', { class: 'btn small', text: 'Copy push URL', onClick: async () => {
+          try {
+            await copyToClipboard(`${location.origin}/api/biometric/push/${d.pushToken}`);
+            toast('Push URL copied to clipboard');
+          } catch (error) {
+            toast(errorMessage(error), 'error');
+          }
+        } }),
+        el('button', { class: 'btn small', text: 'Poll now', onClick: async () => {
+          try {
+            const result = await api(`/api/biometric/devices/${d.id}/poll`, { method: 'POST' });
+            toast(`Poll: ${result.received} received, ${result.inserted} inserted, ${result.errors?.length ?? 0} errors`);
+            render();
+          } catch (error) {
+            toast(errorMessage(error), 'error');
+          }
+        } }),
+        el('button', { class: 'btn small', text: 'Edit', onClick: () => deviceModal(d) }),
+        el('button', { class: 'btn small danger', text: 'Delete', onClick: () => confirmAction(
+          `Delete ${d.name}? Its employee mappings will also be removed.`,
+          () => api(`/api/biometric/devices/${d.id}`, { method: 'DELETE' })) })) },
+    ];
+    return el('div', { class: 'tab-content' },
+      panel('Device registry', [dataTable(columns, devices, {
+        empty: 'No devices registered yet. A push token is generated for every new device.',
+      })], el('button', { class: 'btn primary small', text: 'Register device',
+        onClick: () => deviceModal() })),
+      panel('Ingestion', [el('p', { class: 'muted small', text:
+        'Offline devices import a file, push devices post to the copied webhook URL, and poll devices fetch a JSON endpoint. ' +
+        'Auto-commit writes complete in/out pairs straight to attendance; otherwise review them under Punches.' })]));
+  };
+
+  // ---- Mappings -----------------------------------------------------------
+  const buildMappings = () => {
+    const host = el('div', {}, el('p', { class: 'loading', text: 'Loading…' }));
+    let selected = devices[0]?.id ?? '';
+    const columns = [
+      { key: 'device_user_id', label: 'Device user ID' },
+      { key: 'employee_id', label: 'Employee', render: (m) => empName(m.employee_id) },
+      { key: 'created_at', label: 'Mapped at' },
+      { key: 'actions', label: 'Actions', render: (m) => el('button', {
+        class: 'btn small danger', text: 'Remove', onClick: () => confirmAction(
+          `Remove mapping ${m.device_user_id} → ${empName(m.employee_id)}?`,
+          () => api(`/api/biometric/devices/${selected}/mappings/${m.id}`, { method: 'DELETE' })) }) },
+    ];
+    const load = async () => {
+      if (!selected) {
+        host.replaceChildren(dataTable(columns, [], { empty: 'Register a device first.' }));
+        return;
+      }
+      const rows = await api(`/api/biometric/devices/${selected}/mappings`);
+      host.replaceChildren(dataTable(columns, rows, { empty: 'No device users are mapped yet.' }));
+    };
+    const deviceSelect = selectControl(selectDeviceOptions, selected, async (event) => {
+      selected = event.target.value ? Number(event.target.value) : '';
+      try {
+        await load();
+      } catch (error) {
+        host.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) }));
+      }
+    });
+    const addForm = createForm([
+      { name: 'deviceUserId', label: 'Device user ID', required: true, placeholder: 'e.g. 1001' },
+      { name: 'employeeId', label: 'Employee', type: 'select', required: true, options: employeeChoices },
+    ], 'Add mapping', async (data) => {
+      if (!selected) throw new Error('Select a device first');
+      await api(`/api/biometric/devices/${selected}/mappings`, {
+        method: 'POST', body: { employeeId: Number(data.employeeId), deviceUserId: data.deviceUserId },
+      });
+      load().catch((error) => toast(errorMessage(error), 'error'));
+    }, { successMessage: 'Mapping added' });
+    load().catch((error) => host.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) })));
+    return el('div', { class: 'tab-content' },
+      panel('Mapped users', [deviceSelect, host]),
+      panel('Map a device user to an employee', [addForm]));
+  };
+
+  // ---- Punches ------------------------------------------------------------
+  const buildPunches = () => {
+    const host = el('div', {}, el('p', { class: 'loading', text: 'Loading…' }));
+    const mapButton = (punch) => el('button', { class: 'btn small', text: 'Map', onClick: () => {
+      const modal = openModal(`Map punch #${punch.id}`, createForm([
+        { name: 'employeeId', label: 'Employee', type: 'select', required: true,
+          options: employeeChoices, value: punch.employee_id ?? '' },
+      ], 'Map employee', async (data) => {
+        await api(`/api/biometric/punches/${punch.id}/map`, {
+          method: 'POST', body: { employeeId: Number(data.employeeId) },
+        });
+        modal.close();
+      }, { successMessage: 'Punch mapped' }));
+    } });
+    const rejectButton = (punch) => el('button', { class: 'btn small danger', text: 'Reject', onClick: async () => {
+      try {
+        await api(`/api/biometric/punches/${punch.id}/reject`, { method: 'POST', body: { reason: 'rejected' } });
+        toast('Punch rejected');
+        render();
+      } catch (error) {
+        toast(errorMessage(error), 'error');
+      }
+    } });
+    const columns = [
+      { key: 'id', label: 'ID' },
+      { key: 'device_id', label: 'Device', render: (p) => devName(p.device_id) },
+      { key: 'device_user_id', label: 'Device user' },
+      { key: 'employee_id', label: 'Employee', render: (p) => empName(p.employee_id) },
+      { key: 'punched_at', label: 'Punched at' },
+      { key: 'direction', label: 'Direction', render: (p) => badge(p.direction) },
+      { key: 'source', label: 'Source' },
+      { key: 'status', label: 'Status', render: (p) => badge(p.status) },
+      { key: 'reason', label: 'Reason', render: (p) => p.reason ? el('span', { class: 'small', text: p.reason }) : '—' },
+      { key: 'actions', label: 'Actions', render: (p) => el('div', { class: 'row-actions' },
+        p.status !== 'committed' ? mapButton(p) : null,
+        p.status === 'pending' ? rejectButton(p) : null) },
+    ];
+    const load = async (query = '') => {
+      let rows = await api(`/api/biometric/punches${query ? `?${query}` : ''}`);
+      const params = new URLSearchParams(query);
+      const from = params.get('from');
+      const to = params.get('to');
+      if (from || to) {
+        rows = rows.filter((p) => {
+          const day = String(p.punched_at).slice(0, 10);
+          return (!from || day >= from) && (!to || day <= to);
+        });
+      }
+      host.replaceChildren(dataTable(columns, rows, { empty: 'No punches match these filters.' }));
+    };
+    const filters = createForm([
+      { name: 'deviceId', label: 'Device', type: 'select', options: allDeviceOptions },
+      { name: 'employeeId', label: 'Employee', type: 'select', options: [{ value: '', label: 'All employees' }, ...employeeChoices] },
+      { name: 'status', label: 'Status', type: 'select', options: [{ value: '', label: 'All statuses' }, 'pending', 'committed', 'ignored'] },
+      { name: 'from', label: 'From', type: 'date' },
+      { name: 'to', label: 'To', type: 'date' },
+    ], 'Apply filters', async (data) => {
+      await load(new URLSearchParams(cleanPayload(data)).toString());
+    }, { silent: true });
+    let commitDevice = devices[0]?.id ?? '';
+    const commitSelect = selectControl(deviceChoices, commitDevice, (event) => {
+      commitDevice = event.target.value ? Number(event.target.value) : '';
+    });
+    const commitButton = el('button', { class: 'btn primary', text: 'Commit pending', onClick: async () => {
+      if (!commitDevice) {
+        toast('Register a device first', 'error');
+        return;
+      }
+      try {
+        const result = await api('/api/biometric/punches/commit', {
+          method: 'POST', body: { deviceId: commitDevice },
+        });
+        toast(`Commit: ${result.committed} committed, ${result.ignored} ignored, ${result.skipped} skipped, ${result.errors} errors`);
+        render();
+      } catch (error) {
+        toast(errorMessage(error), 'error');
+      }
+    } });
+    load().catch((error) => host.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) })));
+    return el('div', { class: 'tab-content' },
+      panel('Review queue', [filters, host]),
+      panel('Commit pending punches', [el('p', { class: 'muted small', text:
+        'Pair pending punches into attendance. Existing attendance rows are never overwritten.' }),
+      el('div', { class: 'form-actions' }, commitSelect, commitButton)]));
+  };
+
+  // ---- Import -------------------------------------------------------------
+  const buildImport = () => {
+    const resultHost = el('div');
+    const importForm = createForm([
+      { name: 'deviceId', label: 'Device', type: 'select', required: true, options: deviceChoices, value: devices[0]?.id },
+      { name: 'format', label: 'Format', type: 'select', options: ['csv', 'tsv', 'zkteco', 'json'], value: 'csv' },
+      { name: 'text', label: 'Punch data', type: 'textarea', rows: 10, required: true,
+        placeholder: 'Paste device export rows here, or load a file below.' },
+    ], 'Import punches', async (data) => {
+      const result = await api('/api/biometric/import', { method: 'POST', body: {
+        deviceId: Number(data.deviceId), format: data.format, text: data.text, filename,
+      } });
+      resultHost.replaceChildren(el('div', { class: 'card mt-1' },
+        el('div', { class: 'card-label', text: 'Import result' }),
+        el('div', { class: 'card-note', text:
+          `Received ${result.received} · inserted ${result.inserted} · duplicates ${result.duplicates} · ` +
+          `unmapped ${result.unmapped} · errors ${result.errors.length}` })));
+      toast(`Imported: ${result.inserted} inserted, ${result.duplicates} duplicates, ` +
+        `${result.unmapped} unmapped, ${result.errors.length} errors`);
+    }, { silent: true });
+
+    let filename;
+    const textInput = importForm.elements.text;
+    const preview = el('p', { class: 'muted small', text: '0 non-empty lines ready to import.' });
+    const updatePreview = () => {
+      const lines = textInput.value.split(/\r?\n/).filter((line) => line.trim() !== '');
+      preview.textContent = `${lines.length} non-empty line${lines.length === 1 ? '' : 's'} ready to import.`;
+    };
+    textInput.addEventListener('input', updatePreview);
+    const fileInput = el('input', { type: 'file', accept: '.csv,.tsv,.txt,.json' });
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      try {
+        textInput.value = await file.text();
+        filename = file.name;
+        updatePreview();
+      } catch (error) {
+        toast(errorMessage(error), 'error');
+      }
+    });
+    const fileField = el('label', { class: 'field', text: 'Or load a file' }, fileInput);
+    importForm.insertBefore(fileField, importForm.querySelector('.form-actions'));
+    importForm.insertBefore(preview, importForm.querySelector('.form-actions'));
+
+    return el('div', { class: 'tab-content' },
+      panel('Offline import', [importForm, resultHost]),
+      panel('Supported formats', [el('p', { class: 'muted small', text:
+        'CSV/TSV expect user_id and timestamp columns; ZKTeco accepts ATTLOG lines; JSON accepts ' +
+        '{records:[{userId,timestamp,direction}]}. Duplicate punches are skipped by dedupe key.' })]));
+  };
+
+  // ---- Sync logs ----------------------------------------------------------
+  const buildLogs = () => {
+    const columns = [
+      { key: 'id', label: 'ID' },
+      { key: 'device_id', label: 'Device', render: (r) => devName(r.device_id) },
+      { key: 'source', label: 'Source', render: (r) => badge(r.source) },
+      { key: 'started_at', label: 'Started' },
+      { key: 'finished_at', label: 'Finished' },
+      { key: 'status', label: 'Status', render: (r) => badge(r.status) },
+      { key: 'received', label: 'Received' },
+      { key: 'inserted', label: 'Inserted' },
+      { key: 'duplicates', label: 'Duplicates' },
+      { key: 'rejected', label: 'Rejected' },
+      { key: 'error', label: 'Error', render: (r) => r.error ? el('span', { class: 'small', text: r.error }) : '—' },
+    ];
+    const host = el('div');
+    host.replaceChildren(dataTable(columns, syncRuns, { empty: 'No sync runs recorded yet.' }));
+    const filters = createForm([
+      { name: 'deviceId', label: 'Device', type: 'select', options: allDeviceOptions },
+    ], 'Apply filter', async (data) => {
+      const query = new URLSearchParams(cleanPayload(data));
+      host.replaceChildren(dataTable(columns, await api(`/api/biometric/sync-runs?${query}`),
+        { empty: 'No sync runs for this device.' }));
+    }, { silent: true });
+    return el('div', { class: 'tab-content' }, panel('Sync runs', [filters, host]));
+  };
+
+  // ---- Simulator: reference hardware look, real webhook data --------------
+  const buildSimulator = () => {
+    let deviceId = devices.find((d) => d.ingestionMode === 'push')?.id ?? devices[0]?.id ?? '';
+    let direction = 'in';
+    const badgeNode = el('span', { class: 'badge inactive', text: 'IDLE' });
+    const scanFrame = el('div', { class: 'hw-scan-frame' }, el('div', { class: 'hw-glyph', text: '◉' }));
+    const screenTitle = el('div', { text: 'Awaiting a mapped employee' });
+    const screenDetail = el('div', { class: 'small', text: 'Select a device and a mapped employee, then send a real punch.' });
+    const overlay = el('div', { class: 'hw-screen-overlay' });
+    const chassis = el('div', { class: 'hw-chassis' },
+      el('div', { class: 'hw-bar' },
+        el('div', { class: 'hw-bar-left' }, el('span', { class: 'hw-dot' }), el('strong', { text: 'BIOMETRIC TERMINAL' })),
+        el('div', { class: 'hw-bar-right small', text: 'push webhook · real device token' })),
+      el('div', { class: 'hw-screen' }, badgeNode, scanFrame, screenTitle, screenDetail),
+      overlay,
+      el('div', { class: 'hw-sensor' },
+        el('div', { class: 'hw-sensor-ring', text: '◉' }),
+        el('div', { class: 'small muted', text: 'Biometric / RFID sensor (simulated input)' })));
+
+    const setScanState = (state, title, detail) => {
+      badgeNode.textContent = state.toUpperCase();
+      badgeNode.className = `badge ${
+        state === 'success' ? 'committed' : state === 'denied' ? 'rejected' : state === 'sending' ? 'pending' : 'inactive'}`;
+      scanFrame.className = `hw-scan-frame ${state}`;
+      screenTitle.textContent = title;
+      screenDetail.textContent = detail;
+    };
+    const updateOverlay = () => {
+      const device = deviceById.get(Number(deviceId));
+      overlay.replaceChildren(
+        el('span', { text: `Serial: ${device?.serialNumber ?? '—'}` }),
+        el('span', { text: `Mode: ${device?.ingestionMode ?? '—'}` }),
+        el('span', { text: `Adapter: ${device?.adapter ?? '—'}` }),
+        el('span', { text: `Auto-commit: ${device?.autoCommit ? 'on' : 'off'}` }));
+      screenTitle.textContent = device ? `Device · ${device.name}` : 'No device selected';
+    };
+
+    const employeeSelect = el('select');
+    const loadMappings = async () => {
+      if (!deviceId) {
+        employeeSelect.replaceChildren(el('option', { value: '', text: 'No device' }));
+        return;
+      }
+      const rows = await api(`/api/biometric/devices/${deviceId}/mappings`);
+      employeeSelect.replaceChildren(...rows.map((m) => el('option', {
+        value: m.device_user_id,
+        text: `${empName(m.employee_id)} · user ${m.device_user_id}`,
+      })));
+      if (rows.length === 0) {
+        employeeSelect.replaceChildren(el('option', { value: '', text: 'No mapped employees' }));
+      }
+    };
+    const deviceSelect = selectControl(deviceChoices, deviceId, async (event) => {
+      deviceId = event.target.value ? Number(event.target.value) : '';
+      updateOverlay();
+      try {
+        await loadMappings();
+      } catch (error) {
+        toast(errorMessage(error), 'error');
+      }
+    });
+    const inButton = el('button', { class: 'btn small ok', text: 'Punch IN', onClick: () => setDirection('in') });
+    const outButton = el('button', { class: 'btn small danger', text: 'Punch OUT', onClick: () => setDirection('out') });
+    const setDirection = (next) => {
+      direction = next;
+      inButton.classList.toggle('active', direction === 'in');
+      outButton.classList.toggle('active', direction === 'out');
+    };
+    setDirection('in');
+
+    const resultHost = el('div');
+    const sendButton = el('button', { class: 'btn primary', text: 'Send punch', onClick: async () => {
+      const device = deviceById.get(Number(deviceId));
+      const userId = employeeSelect.value;
+      if (!device) {
+        toast('Register and select a device first', 'error');
+        return;
+      }
+      if (!userId) {
+        toast('Select a mapped employee first', 'error');
+        return;
+      }
+      const now = new Date();
+      const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+        `T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+      setScanState('sending', `Sending ${direction.toUpperCase()} punch`, `User ${userId} · ${timestamp}`);
+      sendButton.disabled = true;
+      try {
+        const response = await api(`/api/biometric/push/${device.pushToken}`, { method: 'POST', body: {
+          records: [{ userId, timestamp, direction, verifyType: 'biometric_simulator', workCode: '0' }],
+        } });
+        setScanState('success', `Accepted · ${direction.toUpperCase()}`,
+          `Server received ${response.received} and inserted ${response.inserted} punch(es).`);
+        resultHost.replaceChildren(dataTable(['field', 'value'], [
+          { field: 'Endpoint', value: `/api/biometric/push/${device.pushToken}` },
+          { field: 'Device user ID', value: userId },
+          { field: 'Employee', value: employeeSelect.selectedOptions[0]?.textContent ?? '—' },
+          { field: 'Timestamp', value: timestamp },
+          { field: 'Direction', value: direction },
+          { field: 'Received', value: response.received },
+          { field: 'Inserted', value: response.inserted },
+        ]));
+        toast(`Punch sent · ${response.inserted} inserted`);
+      } catch (error) {
+        setScanState('denied', 'Push rejected', errorMessage(error));
+        resultHost.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) }));
+        toast(errorMessage(error), 'error');
+      } finally {
+        sendButton.disabled = false;
+      }
+    } });
+
+    const controls = el('div', { class: 'form-grid' },
+      el('label', { class: 'field', text: 'Device' }, deviceSelect),
+      el('label', { class: 'field', text: 'Mapped employee (device user ID)' }, employeeSelect),
+      el('div', { class: 'field' }, el('span', { text: 'Direction' }), el('div', { class: 'row-actions' }, inButton, outButton)),
+      el('div', { class: 'form-actions' }, sendButton));
+
+    updateOverlay();
+    loadMappings().catch((error) => toast(errorMessage(error), 'error'));
+    return el('div', { class: 'tab-content' },
+      panel('Simulated terminal', [chassis]),
+      panel('Send a real punch', [el('p', { class: 'muted small', text:
+        'This calls the device’s public push webhook with the selected user ID and the current wall-clock time. ' +
+        'The server response is shown verbatim below.' }), controls, resultHost]));
+  };
+
+  // ---- Muster matrix: real monthly attendance as a Biometric sub-tab ------
+  const buildMuster = () => {
+    const host = el('div', {}, el('p', { class: 'loading', text: 'Loading…' }));
+    const legend = el('p', { class: 'muted small', text:
+      'P Present · A Absent · HD Half-day · L Leave · WO Weekly off · H Holiday' });
+    const load = async (month, year) => {
+      const from = `${year}-${pad(month)}-01`;
+      const daysInMonth = new Date(year, month, 0).getDate();
+      const to = `${year}-${pad(month)}-${pad(daysInMonth)}`;
+      const [rows, holidays] = await Promise.all([
+        api(`/api/attendance?from=${from}&to=${to}`),
+        api('/api/settings/holidays'),
+      ]);
+      const holidayDates = new Set(holidays.map((h) => String(h.date).slice(0, 10)));
+      const statusByDay = new Map(rows.map((r) => [`${r.employee_id}|${String(r.date).slice(0, 10)}`, r.status]));
+      const codeFor = (employeeId, day) => {
+        const date = `${year}-${pad(month)}-${pad(day)}`;
+        const status = statusByDay.get(`${employeeId}|${date}`);
+        if (holidayDates.has(date) || status === 'Holiday') return holidayDates.has(date) ? 'H' : 'WO';
+        if (status === 'Present') return 'P';
+        if (status === 'Half-day') return 'HD';
+        if (status === 'Absent') return 'A';
+        if (status === 'Leave') return 'L';
+        return '';
+      };
+      const cell = (code) => code
+        ? el('span', { class: `muster-code ${code}`, text: code })
+        : el('span', { class: 'muted', text: '·' });
+      const count = (employee, code) => {
+        let total = 0;
+        for (let day = 1; day <= daysInMonth; day += 1) if (codeFor(employee.id, day) === code) total += 1;
+        return total;
+      };
+      const columns = [
+        { key: 'employee', label: 'Employee', render: (e) => el('span', { text: `${e.code} · ${e.name}` }) },
+        ...Array.from({ length: daysInMonth }, (_, index) => ({
+          label: String(index + 1), render: (e) => cell(codeFor(e.id, index + 1)),
+        })),
+        { label: 'P', render: (e) => count(e, 'P') },
+        { label: 'A', render: (e) => count(e, 'A') },
+        { label: 'HD', render: (e) => count(e, 'HD') },
+        { label: 'L', render: (e) => count(e, 'L') },
+      ];
+      host.replaceChildren(dataTable(columns, employees, { empty: 'No employees to show.' }));
+    };
+    const form = createForm([
+      { name: 'month', label: 'Month', type: 'number', min: 1, max: 12, required: true, value: uiPeriod.month },
+      { name: 'year', label: 'Year', type: 'number', min: 1, required: true, value: uiPeriod.year },
+    ], 'Load matrix', async (data) => {
+      uiPeriod.month = Number(data.month);
+      uiPeriod.year = Number(data.year);
+      await load(uiPeriod.month, uiPeriod.year);
+    }, { silent: true });
+    load(uiPeriod.month, uiPeriod.year).catch((error) =>
+      host.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) })));
+    return el('div', { class: 'tab-content' },
+      panel('Monthly muster matrix', [form, legend, host]));
+  };
+
+  // ---- Local-state tabs (no hash routes) ----------------------------------
+  const tabs = [
+    { key: 'devices', label: 'Devices', build: buildDevices },
+    { key: 'mappings', label: 'Mappings', build: buildMappings },
+    { key: 'punches', label: 'Punches', build: buildPunches },
+    { key: 'import', label: 'Import', build: buildImport },
+    { key: 'logs', label: 'Logs', build: buildLogs },
+    { key: 'simulator', label: 'Simulator', build: buildSimulator },
+    { key: 'muster', label: 'Muster matrix', build: buildMuster },
+  ];
+  const tabBar = el('div', { class: 'tab-bar' });
+  const tabBody = el('div', { class: 'tab-content' });
+  const showTab = async (key) => {
+    const tab = tabs.find((item) => item.key === key) ?? tabs[0];
+    biometricUi.tab = tab.key;
+    for (const button of tabBar.children) {
+      button.classList.toggle('active', button.dataset.key === tab.key);
+    }
+    tabBody.replaceChildren(el('div', { class: 'loading', text: 'Loading…' }));
+    try {
+      tabBody.replaceChildren(await tab.build());
+    } catch (error) {
+      tabBody.replaceChildren(el('div', { class: 'error-box', text: errorMessage(error) }));
+    }
+  };
+  for (const tab of tabs) {
+    tabBar.append(el('button', {
+      class: 'tab', dataset: { key: tab.key }, text: tab.label,
+      onClick: () => showTab(tab.key),
+    }));
+  }
+  await showTab(biometricUi.tab);
+
+  return screen('Biometric',
+    'Register devices, map employees, review punches and simulate real device pushes.',
+    tabBar, tabBody);
 }
 
 // ---------------------------------------------------------------------------
