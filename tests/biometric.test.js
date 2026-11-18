@@ -145,3 +145,80 @@ test('a lone in punch commits as Half-day', async () => {
     assert.equal(att.body[0].status, 'Half-day');
   } finally { await h.close(); }
 });
+
+test('auto_commit commits complete pairs and leaves lone punches pending until paired', async () => {
+  const h = await setup();
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'Auto Gate', serialNumber: 'SN-008', autoCommit: 1,
+    })).body;
+    await h.client.post(`/api/biometric/devices/${device.id}/mappings`, { employeeId: 3, deviceUserId: '1042' });
+
+    // A complete in+out pair commits immediately on import.
+    const paired = await h.client.post('/api/biometric/import', {
+      deviceId: device.id, format: 'csv',
+      text: 'user_id,timestamp,direction\n1042,2026-02-10 09:05:00,in\n1042,2026-02-10 18:10:00,out\n',
+    });
+    assert.equal(paired.body.inserted, 2);
+    const committed = await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=committed`);
+    assert.equal(committed.body.length, 2);
+    const firstAtt = await h.client.get('/api/attendance?employeeId=3&from=2026-02-10&to=2026-02-10');
+    assert.equal(firstAtt.body.length, 1);
+    assert.equal(firstAtt.body[0].status, 'Present');
+
+    // A lone in stays pending and writes no attendance row.
+    const lone = await h.client.post('/api/biometric/import', {
+      deviceId: device.id, format: 'csv',
+      text: 'user_id,timestamp,direction\n1042,2026-02-11 09:00:00,in\n',
+    });
+    assert.equal(lone.body.inserted, 1);
+    const pending = await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=pending`);
+    assert.equal(pending.body.length, 1);
+    const noAtt = await h.client.get('/api/attendance?employeeId=3&from=2026-02-11&to=2026-02-11');
+    assert.equal(noAtt.body.length, 0);
+
+    // Arriving out completes the earlier lone in; both punches commit now.
+    const out = await h.client.post('/api/biometric/import', {
+      deviceId: device.id, format: 'csv',
+      text: 'user_id,timestamp,direction\n1042,2026-02-11 18:00:00,out\n',
+    });
+    assert.equal(out.body.inserted, 1);
+    const nowCommitted = await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=committed`);
+    assert.equal(nowCommitted.body.length, 4);
+    assert.equal((await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=pending`)).body.length, 0);
+    const secondAtt = await h.client.get('/api/attendance?employeeId=3&from=2026-02-11&to=2026-02-11');
+    assert.equal(secondAtt.body.length, 1);
+    assert.equal(secondAtt.body[0].status, 'Present');
+  } finally { await h.close(); }
+});
+
+test('auto_commit keeps unmapped pairs pending so they re-resolve after mapping', async () => {
+  const h = await setup();
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'Auto Gate', serialNumber: 'SN-009', autoCommit: 1,
+    })).body;
+    await h.client.post('/api/biometric/import', {
+      deviceId: device.id, format: 'csv',
+      text: 'user_id,timestamp,direction\n8888,2026-02-20 09:00:00,in\n8888,2026-02-20 18:00:00,out\n',
+    });
+
+    // A complete but unmapped pair must NOT be auto-committed or marked ignored.
+    const pending = await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=pending`);
+    assert.equal(pending.body.length, 2);
+    assert.ok(pending.body.every((punch) => punch.reason === 'unmapped_user'));
+    const noAtt = await h.client.get('/api/attendance?employeeId=3&from=2026-02-20&to=2026-02-20');
+    assert.equal(noAtt.body.length, 0);
+
+    // Once mapped, the pending punches re-resolve and a later commit writes attendance.
+    await h.client.post(`/api/biometric/devices/${device.id}/mappings`, { employeeId: 3, deviceUserId: '8888' });
+    const resolved = await h.client.get(`/api/biometric/punches?deviceId=${device.id}&status=pending`);
+    assert.equal(resolved.body.length, 2);
+    assert.ok(resolved.body.every((punch) => punch.employee_id === 3 && punch.reason === null));
+
+    await h.client.post('/api/biometric/punches/commit', { deviceId: device.id });
+    const att = await h.client.get('/api/attendance?employeeId=3&from=2026-02-20&to=2026-02-20');
+    assert.equal(att.body.length, 1);
+    assert.equal(att.body[0].status, 'Present');
+  } finally { await h.close(); }
+});
