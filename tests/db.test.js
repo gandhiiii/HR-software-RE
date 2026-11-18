@@ -8,10 +8,11 @@ import { openDatabase, TABLES, DATA_PATH, SEED_ADMIN } from '../lib/db.js';
 // Literal expected names — independent of lib/db.js's SCHEMA/TABLES, so
 // deleting a table from the schema cannot make this test pass.
 const EXPECTED_TABLES = [
-  'asset_assignments', 'assets', 'attendance', 'departments', 'designations',
-  'employees', 'expenses', 'holidays', 'leave_balances', 'leave_requests',
-  'leave_types', 'payroll_runs', 'payslips', 'settings', 'shifts',
-  'task_comments', 'tasks', 'users',
+  'asset_assignments', 'assets', 'attendance', 'biometric_devices',
+  'biometric_employee_map', 'biometric_punches', 'biometric_sync_runs',
+  'departments', 'designations', 'employees', 'expenses', 'holidays',
+  'leave_balances', 'leave_requests', 'leave_types', 'payroll_runs', 'payslips',
+  'settings', 'shifts', 'task_comments', 'tasks', 'users',
 ];
 
 test('creates all tables and seeds admin once', () => {
@@ -21,6 +22,17 @@ test('creates all tables and seeds admin once', () => {
     assert.doesNotThrow(() => db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get());
   }
   assert.equal(db.prepare('SELECT count(*) n FROM users').get().n, 3);
+  db.close();
+});
+
+test('sqlite_master contains all 22 expected tables', () => {
+  const db = openDatabase({ path: ':memory:', seed: true });
+  const names = new Set(
+    db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name),
+  );
+  for (const t of EXPECTED_TABLES) {
+    assert.ok(names.has(t), `missing table in sqlite_master: ${t}`);
+  }
   db.close();
 });
 
