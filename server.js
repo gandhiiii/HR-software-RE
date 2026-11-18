@@ -22,6 +22,7 @@ import { registerTaskRoutes } from './api/tasks.js';
 import { registerAssetRoutes } from './api/assets.js';
 import { registerReportRoutes } from './api/reports.js';
 import { registerSettingsRoutes } from './api/settings.js';
+import { registerBiometricRoutes } from './api/biometric.js';
 
 const HOST = '127.0.0.1';
 const PORT = 3000;
@@ -45,6 +46,7 @@ export function registerAllRoutes(router) {
   registerAssetRoutes(router);
   registerReportRoutes(router);
   registerSettingsRoutes(router);
+  registerBiometricRoutes(router);
 }
 
 /**
