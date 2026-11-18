@@ -524,13 +524,23 @@ async function screenDashboard() {
 // ---------------------------------------------------------------------------
 
 async function screenEmployees() {
-  const [employees, departments, designations, shifts, devices] = await Promise.all([
+  // Core employee data loads independently of the biometric subsystem.
+  const [employees, departments, designations, shifts] = await Promise.all([
     api('/api/employees'), api('/api/departments'), api('/api/designations'), api('/api/shifts'),
-    api('/api/biometric/devices'),
   ]);
   // Biometric identity lives in biometric_employee_map — never in employees.
-  const mappingLists = await Promise.all(devices.map((d) =>
-    api(`/api/biometric/devices/${d.id}/mappings`)));
+  // These lookups are optional: an unavailable biometric API or a role change
+  // must degrade to "no mappings", never take the Employees screen down.
+  let devices = [];
+  let mappingLists = [];
+  try {
+    devices = await api('/api/biometric/devices');
+    mappingLists = await Promise.all(devices.map((d) =>
+      api(`/api/biometric/devices/${d.id}/mappings`)));
+  } catch {
+    devices = [];
+    mappingLists = [];
+  }
   const mappingByEmployee = new Map();
   devices.forEach((device, index) => {
     for (const mapping of mappingLists[index]) {

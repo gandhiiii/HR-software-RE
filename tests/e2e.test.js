@@ -100,6 +100,37 @@ test('biometric screen is wired into the SPA shell and its API is HR-only', asyn
   }
 });
 
+test('hr has biometric API access and Employees screen degrades if biometric lookups fail', async () => {
+  const h = await setup();
+  try {
+    // The other HR role must be able to use the biometric screen too.
+    const login = await h.client.post('/api/auth/login', { username: 'hr', password: 'admin123' });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.role, 'hr');
+    const devices = await h.client.get('/api/biometric/devices');
+    assert.equal(devices.status, 200, JSON.stringify(devices.body));
+    assert.ok(Array.isArray(devices.body));
+
+    // Static wiring check (no DOM harness in this repo): core employee data is
+    // loaded on its own, and the optional biometric lookups fall back to empty
+    // arrays inside a try/catch so a failure cannot block the screen.
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    const start = js.text.indexOf('async function screenEmployees()');
+    assert.ok(start >= 0, 'screenEmployees must exist');
+    const source = js.text.slice(start, js.text.indexOf('// ---', start));
+    assert.match(source,
+      /const \[employees, departments, designations, shifts\] = await Promise\.all\(\[/,
+      'core employee data must load without biometric calls');
+    assert.doesNotMatch(source, /designations\), api\/shifts'\),\s*api\('\/api\/biometric/);
+    assert.match(source, /let devices = \[\];/, 'device fallback must be an empty array');
+    assert.match(source, /try \{[\s\S]*?api\('\/api\/biometric\/devices'\)[\s\S]*?\} catch \{[\s\S]*?devices = \[\]/,
+      'biometric lookups must be guarded with an empty-array fallback');
+  } finally {
+    await h.close();
+  }
+});
+
 test('unauthenticated API calls from the UI pattern still return 401', async () => {
   const h = await setup();
   try {
