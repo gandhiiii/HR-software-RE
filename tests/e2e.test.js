@@ -383,6 +383,36 @@ test('end-to-end walkthrough exercises every module through the production serve
     assert.match(aliasCsv.headers.get('content-type'), /text\/csv/i);
     assert.match(aliasCsv.text, /employee_id/);
 
+    // --- 11. Biometric device -> import -> commit -> payroll ----------------
+    const device = await client.post('/api/biometric/devices', { name: 'E2E Gate', serialNumber: 'SN-E2E', ingestionMode: 'offline', adapter: 'zkteco_adms' });
+    assert.equal(device.status, 201);
+    assert.ok(device.body.id, 'a registered device must have an id');
+    assert.ok(device.body.pushToken, 'every device receives a random push token');
+    const mapping = await client.post(`/api/biometric/devices/${device.body.id}/mappings`, { employeeId: empId, deviceUserId: '9001' });
+    assert.equal(mapping.status, 201);
+    const imported = await client.post('/api/biometric/import', {
+      deviceId: device.body.id, format: 'zkteco', text: '9001\t2026-02-03 09:00:00\t0\t1\t0\n9001\t2026-02-03 18:00:00\t1\t1\t0\n',
+    });
+    assert.equal(imported.status, 201, JSON.stringify(imported.body));
+    assert.equal(imported.body.inserted, 2);
+    const committed = await client.post('/api/biometric/punches/commit', { deviceId: device.body.id });
+    assert.equal(committed.body.committed, 2);
+    const punches = await client.get(`/api/biometric/punches?deviceId=${device.body.id}`);
+    assert.equal(punches.status, 200);
+    assert.equal(punches.body.length, 2);
+    assert.ok(punches.body.every((p) => p.status === 'committed'), 'both punches must be committed');
+
+    // Run payroll for the punch month and assert the payslip exists / present
+    // days counted from the committed first-in/last-out pair.
+    const bioRun = await client.post('/api/payroll/run', { month: 2, year: YEAR });
+    assert.equal(bioRun.status, 200, JSON.stringify(bioRun.body));
+    const bioSlip = bioRun.body.slips.find((s) => s.employee_id === empId);
+    assert.ok(bioSlip, 'payroll must produce a slip for the biometric employee');
+    assert.equal(bioSlip.present_days, 1, 'the committed punch pair counts as one present day');
+    const bioSlipView = await client.get(`/api/payroll/slips/${bioSlip.id}`);
+    assert.equal(bioSlipView.status, 200);
+    assert.equal(bioSlipView.body.present_days, 1);
+
     // --- Logout closes the session -----------------------------------------
     const logout = await client.post('/api/auth/logout', {});
     assert.equal(logout.status, 200);
