@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { deriveAttendance } from '../lib/calc/attendance.js';
-import { registerAttendanceRoutes } from '../api/attendance.js';
+import { registerAttendanceRoutes, recordAttendance } from '../api/attendance.js';
 import { insertRow } from '../lib/repo.js';
 
 const SHIFT = { start_time: '09:00', end_time: '18:00', grace_minutes: 10, weekly_off_day: 0 };
@@ -383,5 +383,20 @@ test('GET /api/shifts lists the seeded shift for all three roles', async () => {
     } finally {
       await h.close();
     }
+  }
+});
+
+// Regression for the shared recordAttendance extraction (biometric commit reuses it).
+test('recordAttendance is exported and the manual route still records Present (201)', async () => {
+  assert.equal(typeof recordAttendance, 'function');
+  const h = await setup('hr');
+  try {
+    const created = await h.client.post('/api/attendance', {
+      employeeId: 3, date: '2026-03-10', punchIn: '09:00', punchOut: '18:00',
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.status, 'Present');
+  } finally {
+    await h.close();
   }
 });

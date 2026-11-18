@@ -139,8 +139,12 @@ function upsertAttendance(db, row) {
  * ignored, and the shift is always resolved from the employee's own record.
  * Automatic weekly-off/holiday detection is a system rule (date + settings), so
  * it still applies on both paths.
+ *
+ * Exported so the biometric commit path reuses this exact validation/derivation
+ * logic rather than duplicating it. Returns the upsert result
+ * `{ status, body }` whose `body` is the created/updated attendance row.
  */
-function recordAttendance(db, body, { forcedEmployeeId, selfService = false } = {}) {
+export function recordAttendance(db, body, { forcedEmployeeId, selfService = false } = {}) {
   const record = buildRecord(
     db,
     selfService ? { ...body, employeeId: forcedEmployeeId } : body,

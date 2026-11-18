@@ -21,6 +21,12 @@
 import { randomBytes } from 'node:crypto';
 import { getRow, listRows, insertRow, updateRow, deleteRow } from '../lib/repo.js';
 import { requireFields } from '../lib/validate.js';
+import { parsePunchText } from '../lib/calc/biometric.js';
+import {
+  ingestPunches,
+  resolvePunchEmployees,
+  commitPending,
+} from '../lib/biometric-ingest.js';
 
 const HR_ROLES = ['admin', 'hr'];
 
@@ -296,6 +302,8 @@ function addMapping(db, rawId, body) {
   } catch (error) {
     rethrowConflict(error, 'Device user or employee is already mapped on this device');
   }
+  // Any punches that arrived before the mapping existed can now be resolved.
+  resolvePunchEmployees(db, deviceId);
   return { status: 201, body: getRow(db, 'biometric_employee_map', mappingId) };
 }
 
@@ -307,6 +315,107 @@ function deleteMapping(db, rawId, rawMappingId) {
   if (!mapping || mapping.device_id !== deviceId) throw httpError(404, 'Mapping not found');
   deleteRow(db, 'biometric_employee_map', mappingId);
   return { status: 200, body: { ok: true } };
+}
+
+// ---------------------------------------------------------------------------
+// Ingest (offline import), punch review and attendance commit
+// ---------------------------------------------------------------------------
+
+const PUNCH_FORMATS = new Set(['csv', 'tsv', 'zkteco', 'json']);
+
+/** Resolve a punch id from a path param, or throw 400/404. */
+function getPunchOr404(db, rawId) {
+  const id = positiveId(rawId);
+  if (id === null) throw httpError(400, 'Punch id must be a positive integer');
+  const punch = getRow(db, 'biometric_punches', id);
+  if (!punch) throw httpError(404, 'Punch not found');
+  return { id, punch };
+}
+
+/** Offline import: parse text, ingest rows, and record the sync run. */
+function importPunches(db, body) {
+  requireFields(body, ['deviceId', 'format', 'text']);
+  const { device } = getDeviceOr404(db, body.deviceId);
+  const format = String(body.format).toLowerCase();
+  if (!PUNCH_FORMATS.has(format)) throw httpError(400, `Unsupported punch format: ${body.format}`);
+  if (typeof body.text !== 'string') throw httpError(400, 'text must be a string');
+
+  const { rows, errors: parseErrors } = parsePunchText(body.text, format);
+  const autoCommit = device.auto_commit === 1 || device.auto_commit === true;
+  const result = ingestPunches(db, device, rows, 'import', { autoCommit });
+  // Surface parse-time rejections alongside normalization/DB errors.
+  result.errors = [...parseErrors, ...result.errors];
+  return { status: 201, body: result };
+}
+
+/** List stored punches, optionally filtered by device, status and employee. */
+function listPunches(db, query) {
+  const clauses = [];
+  const params = [];
+  if (query.deviceId !== undefined && query.deviceId !== '') {
+    const id = positiveId(query.deviceId);
+    if (id === null) throw httpError(400, 'deviceId must be a positive integer');
+    clauses.push('device_id = ?');
+    params.push(id);
+  }
+  if (query.status !== undefined && query.status !== '') {
+    if (typeof query.status !== 'string') throw httpError(400, 'status must be a string');
+    clauses.push('status = ?');
+    params.push(query.status);
+  }
+  if (query.employeeId !== undefined && query.employeeId !== '') {
+    const id = positiveId(query.employeeId);
+    if (id === null) throw httpError(400, 'employeeId must be a positive integer');
+    clauses.push('employee_id = ?');
+    params.push(id);
+  }
+  const whereSql = clauses.length > 0 ? clauses.join(' AND ') : '1=1';
+  return { status: 200, body: listRows(db, 'biometric_punches', whereSql, params) };
+}
+
+/** Manually assign an employee to a reviewed punch (also clears the reason). */
+function mapPunch(db, rawId, body) {
+  const { id } = getPunchOr404(db, rawId);
+  requireFields(body, ['employeeId']);
+  const employeeId = resolveEmployeeId(body.employeeId);
+  assertEmployeeExists(db, employeeId);
+  updateRow(db, 'biometric_punches', id, {
+    employee_id: employeeId,
+    status: 'pending',
+    reason: null,
+  });
+  return { status: 200, body: getRow(db, 'biometric_punches', id) };
+}
+
+/** Reject a punch so it is never considered for commit. */
+function rejectPunch(db, rawId, body) {
+  const { id } = getPunchOr404(db, rawId);
+  const reason = typeof body?.reason === 'string' && body.reason.trim()
+    ? body.reason.trim()
+    : 'rejected';
+  updateRow(db, 'biometric_punches', id, { status: 'ignored', reason });
+  return { status: 200, body: getRow(db, 'biometric_punches', id) };
+}
+
+/** Review-and-commit entry point. */
+function commitPunches(db, body) {
+  requireFields(body, ['deviceId']);
+  const { id: deviceId } = getDeviceOr404(db, body.deviceId);
+  return { status: 200, body: commitPending(db, { deviceId }) };
+}
+
+/** List sync-run history, optionally for one device. */
+function listSyncRuns(db, query) {
+  const clauses = [];
+  const params = [];
+  if (query.deviceId !== undefined && query.deviceId !== '') {
+    const id = positiveId(query.deviceId);
+    if (id === null) throw httpError(400, 'deviceId must be a positive integer');
+    clauses.push('device_id = ?');
+    params.push(id);
+  }
+  const whereSql = clauses.length > 0 ? clauses.join(' AND ') : '1=1';
+  return { status: 200, body: listRows(db, 'biometric_sync_runs', whereSql, params) };
 }
 
 /** Register all biometric routes. */
@@ -339,5 +448,27 @@ export function registerBiometricRoutes(router) {
 
   router.register('DELETE', '/api/biometric/devices/:id/mappings/:mappingId', HR_ROLES, async ({ db, params }) =>
     deleteMapping(db, params.id, params.mappingId),
+  );
+
+  // Offline import + sync-run history.
+  router.register('POST', '/api/biometric/import', HR_ROLES, async ({ db, body }) =>
+    importPunches(db, body),
+  );
+  router.register('GET', '/api/biometric/sync-runs', HR_ROLES, async ({ db, query }) =>
+    listSyncRuns(db, query),
+  );
+
+  // Punch review queue. `commit` is registered before the :id routes for clarity.
+  router.register('GET', '/api/biometric/punches', HR_ROLES, async ({ db, query }) =>
+    listPunches(db, query),
+  );
+  router.register('POST', '/api/biometric/punches/commit', HR_ROLES, async ({ db, body }) =>
+    commitPunches(db, body),
+  );
+  router.register('POST', '/api/biometric/punches/:id/map', HR_ROLES, async ({ db, params, body }) =>
+    mapPunch(db, params.id, body),
+  );
+  router.register('POST', '/api/biometric/punches/:id/reject', HR_ROLES, async ({ db, params, body }) =>
+    rejectPunch(db, params.id, body),
   );
 }
