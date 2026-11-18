@@ -20,7 +20,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { getRow, listRows, insertRow, updateRow, deleteRow } from '../lib/repo.js';
-import { verifyPassword } from '../lib/auth.js';
+import { hashPassword, verifyPassword } from '../lib/auth.js';
 import { requireFields } from '../lib/validate.js';
 import { parsePunchText } from '../lib/calc/biometric.js';
 import {
@@ -44,7 +44,9 @@ const DEVICE_FIELDS = {
   location: 'location',
   ingestionMode: 'ingestion_mode',
   adapter: 'adapter',
-  pushSecretHash: 'push_secret_hash',
+  // `push_secret_hash` is deliberately NOT client-settable. The only way to
+  // provision a bearer secret is PATCH { rotateSecret: true } (or the same key
+  // on create), which returns the plaintext once and stores only `salt:hash`.
   pollEndpoint: 'poll_endpoint',
   pollHeadersJson: 'poll_headers_json',
   pollIntervalSeconds: 'poll_interval_seconds',
@@ -54,7 +56,7 @@ const DEVICE_FIELDS = {
 
 const DEVICE_STRING_COLUMNS = [
   'vendor', 'model', 'device_type', 'ip_address', 'location', 'ingestion_mode',
-  'adapter', 'push_secret_hash', 'poll_endpoint', 'poll_headers_json',
+  'adapter', 'poll_endpoint', 'poll_headers_json',
 ];
 
 function httpError(status, message) {
@@ -76,6 +78,18 @@ function positiveId(value) {
 /** SQLite-style UTC timestamp (datetime('now') produces the same shape). */
 function nowSql() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/**
+ * Provision a fresh bearer secret. The plaintext is returned to the caller
+ * exactly once; only the combined `salt:hash` (via the repo's `hashPassword`)
+ * is persisted. `hashPassword` uses synchronous scrypt because that is the
+ * existing auth contract — see the note on `verifyDeviceSecret` below.
+ */
+function newDeviceSecret() {
+  const plaintext = randomBytes(24).toString('hex');
+  const { salt, hash } = hashPassword(plaintext);
+  return { plaintext, stored: `${salt}:${hash}` };
 }
 
 /** Resolve a device id from a path param, or throw 400/404. Returns the raw row. */
@@ -212,6 +226,13 @@ function createDevice(db, body) {
   const data = normalizeDeviceData(pickDeviceColumns(body));
   validateDeviceData(data);
 
+  let plaintextSecret = null;
+  if (body?.rotateSecret === true) {
+    const generated = newDeviceSecret();
+    plaintextSecret = generated.plaintext;
+    data.push_secret_hash = generated.stored;
+  }
+
   let id;
   try {
     id = insertRow(db, 'biometric_devices', {
@@ -236,7 +257,9 @@ function createDevice(db, body) {
   } catch (error) {
     rethrowConflict(error, 'A device with this serial number already exists');
   }
-  return { status: 201, body: presentDevice(getRow(db, 'biometric_devices', id)) };
+  const present = presentDevice(getRow(db, 'biometric_devices', id));
+  if (plaintextSecret !== null) present.pushSecret = plaintextSecret;
+  return { status: 201, body: present };
 }
 
 function getDevice(db, rawId) {
@@ -250,6 +273,13 @@ function updateDevice(db, rawId, body) {
   validateDeviceData(data, { partial: true });
   if (data.name !== undefined) data.name = data.name.trim();
   if (data.serial_number !== undefined) data.serial_number = data.serial_number.trim();
+
+  let plaintextSecret = null;
+  if (body?.rotateSecret === true) {
+    const generated = newDeviceSecret();
+    plaintextSecret = generated.plaintext;
+    data.push_secret_hash = generated.stored;
+  }
   if (Object.keys(data).length > 0) {
     try {
       updateRow(db, 'biometric_devices', id, { ...data, updated_at: nowSql() });
@@ -257,7 +287,10 @@ function updateDevice(db, rawId, body) {
       rethrowConflict(error, 'A device with this serial number already exists');
     }
   }
-  return { status: 200, body: presentDevice(getRow(db, 'biometric_devices', id)) };
+  const present = presentDevice(getRow(db, 'biometric_devices', id));
+  // The plaintext exists only in this one response; later reads see the hash.
+  if (plaintextSecret !== null) present.pushSecret = plaintextSecret;
+  return { status: 200, body: present };
 }
 
 function deleteDevice(db, rawId) {
@@ -458,6 +491,11 @@ function bearerSecret(headers) {
 /**
  * A device without a stored secret needs no bearer token; one with a secret
  * MUST present a matching `Bearer` token. `push_secret_hash` is `salt:hash`.
+ *
+ * CONSTRAINT: `verifyPassword` runs Node's synchronous scrypt here because the
+ * repo reuses its single password-hashing contract. There is no async variant
+ * in `lib/auth.js`, so this check is intentionally blocking on a public route;
+ * changing that needs a separate decision (async scrypt and/or rate limiting).
  */
 function verifyDeviceSecret(device, headers) {
   const stored = device.push_secret_hash;
@@ -473,10 +511,34 @@ function deviceAutoCommit(device) {
   return device.auto_commit === 1 || device.auto_commit === true;
 }
 
+/**
+ * The single gate every public device-facing push path passes through after
+ * authenticating the caller. A decommissioned device must stop accepting
+ * punches on exactly these endpoints, and a device must be configured for the
+ * endpoint it calls. `403` is the repo's "authenticated but not allowed"
+ * status; a wrong token/secret/serial remains `401`.
+ *
+ * @param {object} device the token/serial-resolved device row
+ * @param {{mode?:string, adapter?:string}} required endpoint capabilities
+ */
+function assertDevicePushAllowed(device, { mode, adapter } = {}) {
+  if (device.enabled !== 1 && device.enabled !== true) {
+    throw httpError(403, 'Device is disabled');
+  }
+  if (mode !== undefined && device.ingestion_mode !== mode) {
+    throw httpError(403, `Device must use ${mode} ingestion mode for this endpoint`);
+  }
+  if (adapter !== undefined && device.adapter !== adapter) {
+    throw httpError(403, `Device must use the ${adapter} adapter for this endpoint`);
+  }
+  return device;
+}
+
 /** Generic JSON webhook: the token in the URL is the credential. */
 function pushJsonBatch(db, token, body, headers) {
   const device = deviceByPushToken(db, token);
   if (!device || !verifyDeviceSecret(device, headers)) throw httpError(401, 'Invalid push token');
+  assertDevicePushAllowed(device, { mode: 'push' });
   const { rows } = parsePunchText(JSON.stringify(body ?? {}), 'json');
   const result = ingestPunches(db, device, rows, 'push', { autoCommit: deviceAutoCommit(device) });
   return { status: 200, body: { received: result.received, inserted: result.inserted } };
@@ -488,13 +550,25 @@ function admsDevice(db, query, headers) {
   if (!device || !verifyDeviceSecret(device, headers)) {
     throw httpError(401, 'Invalid device serial number');
   }
+  assertDevicePushAllowed(device, { adapter: 'zkteco_adms' });
   return device;
 }
+
+/** The option block ZKTeco ADMS firmware expects before it enters realtime mode. */
+const ADMS_OPTIONS = [
+  'GET OPTIONS',
+  'Realtime=1',
+  'TransInterval=1',
+  'TransFlag=1',
+  'ServerVer=1.0.0',
+  'Encrypt=None',
+  '',
+].join('\n');
 
 /** ADMS devices poll this endpoint for their configuration on startup. */
 function admsOptions(db, query, headers) {
   admsDevice(db, query, headers);
-  return { status: 200, body: 'GET OPTIONS\nRealtime=1\n', headers: ADMS_TEXT_HEADER };
+  return { status: 200, body: ADMS_OPTIONS, headers: ADMS_TEXT_HEADER };
 }
 
 /** Headerless, tab-separated ATTLOG rows: acknowledge with `OK: <inserted>`. */

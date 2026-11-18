@@ -573,17 +573,20 @@ async function screenEmployees() {
     const deviceId = data.biometricDeviceId;
     const code = String(data.biometricCode ?? '').trim();
     const existing = mappingByEmployee.get(employeeId);
-    if (source === 'mobile') {
-      if (existing) {
-        await api(`/api/biometric/devices/${existing.deviceId}/mappings/${existing.id}`, { method: 'DELETE' });
-        mappingByEmployee.delete(employeeId);
-      }
-      return;
-    }
-    if (!deviceId || !code) return; // all biometric fields are optional
-    if (existing && (String(existing.deviceId) !== String(deviceId) || existing.device_user_id !== code)) {
+    const unmap = async () => {
+      if (!existing) return;
       await api(`/api/biometric/devices/${existing.deviceId}/mappings/${existing.id}`, { method: 'DELETE' });
       mappingByEmployee.delete(employeeId);
+    };
+    // Blank device/code or a non-biometric source is an explicit unassign. The
+    // old mapping MUST be deleted, otherwise punches keep attributing to this
+    // employee and can silently flow into payroll. ('both' still uses biometric.)
+    if (source === 'mobile' || !deviceId || !code) {
+      await unmap();
+      return;
+    }
+    if (existing && (String(existing.deviceId) !== String(deviceId) || existing.device_user_id !== code)) {
+      await unmap();
     }
     const created = await api(`/api/biometric/devices/${deviceId}/mappings`, {
       method: 'POST', body: { employeeId, deviceUserId: code },
@@ -1228,20 +1231,37 @@ async function screenBiometric() {
       const from = `${year}-${pad(month)}-01`;
       const daysInMonth = new Date(year, month, 0).getDate();
       const to = `${year}-${pad(month)}-${pad(daysInMonth)}`;
-      const [rows, holidays] = await Promise.all([
+      // Approved leave requests do not create attendance rows, so they must be
+      // fetched separately or leave days would be silently undercounted.
+      const [rows, holidays, leaveRequests] = await Promise.all([
         api(`/api/attendance?from=${from}&to=${to}`),
         api('/api/settings/holidays'),
+        api('/api/leave/requests?status=approved'),
       ]);
       const holidayDates = new Set(holidays.map((h) => String(h.date).slice(0, 10)));
       const statusByDay = new Map(rows.map((r) => [`${r.employee_id}|${String(r.date).slice(0, 10)}`, r.status]));
+      const leaveDatesByEmployee = new Map();
+      const monthPrefix = `${year}-${pad(month)}-`;
+      for (const request of leaveRequests) {
+        if (request.status !== 'approved') continue;
+        const employeeId = String(request.employee_id);
+        const leaveFrom = String(request.from_date ?? '').slice(0, 10);
+        const leaveTo = String(request.to_date ?? '').slice(0, 10);
+        for (let day = 1; day <= daysInMonth; day += 1) {
+          const date = `${monthPrefix}${pad(day)}`;
+          if (date < leaveFrom || date > leaveTo) continue;
+          if (!leaveDatesByEmployee.has(employeeId)) leaveDatesByEmployee.set(employeeId, new Set());
+          leaveDatesByEmployee.get(employeeId).add(date);
+        }
+      }
       const codeFor = (employeeId, day) => {
-        const date = `${year}-${pad(month)}-${pad(day)}`;
+        const date = `${monthPrefix}${pad(day)}`;
         const status = statusByDay.get(`${employeeId}|${date}`);
         if (holidayDates.has(date) || status === 'Holiday') return holidayDates.has(date) ? 'H' : 'WO';
         if (status === 'Present') return 'P';
         if (status === 'Half-day') return 'HD';
         if (status === 'Absent') return 'A';
-        if (status === 'Leave') return 'L';
+        if (status === 'Leave' || leaveDatesByEmployee.get(String(employeeId))?.has(date)) return 'L';
         return '';
       };
       const cell = (code) => code

@@ -131,6 +131,38 @@ test('hr has biometric API access and Employees screen degrades if biometric loo
   }
 });
 
+test('employee form clears stale mappings and muster counts approved leave', async () => {
+  const h = await setup();
+  try {
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    const src = js.text;
+
+    // Clearing the biometric code/device (or switching to Mobile) must unmap,
+    // otherwise punches keep attributing to the employee and reach payroll.
+    const empStart = src.indexOf('async function screenEmployees()');
+    assert.ok(empStart >= 0, 'screenEmployees must exist');
+    const empSrc = src.slice(empStart, src.indexOf('// ---', empStart));
+    assert.match(empSrc, /if \(source === 'mobile' \|\| !deviceId \|\| !code\) \{[\s\S]*?await unmap\(\)/,
+      'blank device/code must trigger an unmap');
+    assert.match(empSrc, /const unmap = async \(\) => \{[\s\S]*?mappings\/\$\{existing\.id\}[\s\S]*?method: 'DELETE'/,
+      'unmap must DELETE the existing mapping');
+
+    // Approved leave requests create no attendance rows, so the muster matrix
+    // must fetch them explicitly and mark their dates L.
+    const musterStart = src.indexOf('const buildMuster = () =>');
+    assert.ok(musterStart >= 0, 'muster matrix must exist');
+    const musterSrc = src.slice(musterStart, src.indexOf('// ---- Local-state tabs', musterStart));
+    assert.match(musterSrc, /api\('\/api\/leave\/requests\?status=approved'\)/,
+      'approved leave requests must be fetched for the muster matrix');
+    assert.match(musterSrc,
+      /status === 'Leave' \|\| leaveDatesByEmployee\.get\(String\(employeeId\)\)\?\.has\(date\)/,
+      'approved leave dates must render as L');
+  } finally {
+    await h.close();
+  }
+});
+
 test('unauthenticated API calls from the UI pattern still return 401', async () => {
   const h = await setup();
   try {
