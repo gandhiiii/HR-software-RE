@@ -68,6 +68,101 @@ test('GET /app.js and GET /styles.css return 200 with the right content types', 
   }
 });
 
+test('biometric screen is wired into the SPA shell and its API is HR-only', async () => {
+  const h = await setup();
+  try {
+    // The hash route is client-side: the server serves the same SPA shell at /.
+    const shell = await h.client.get('/');
+    assert.equal(shell.status, 200);
+    assert.match(shell.text, /id=["']app["']/, 'shell must contain the app mount point');
+
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    assert.match(js.text, /key: 'biometric'/, 'Biometric must be a NAV item');
+    assert.match(js.text, /\{ key: 'biometric'[^}]*roles: HR_ROLES \}/,
+      'Biometric nav must be restricted to HR roles');
+    assert.match(js.text, /biometric: screenBiometric/, 'Biometric must be registered in SCREENS');
+
+    const login = await h.client.post('/api/auth/login', { username: 'admin', password: 'admin123' });
+    assert.equal(login.status, 200);
+    const devices = await h.client.get('/api/biometric/devices');
+    assert.equal(devices.status, 200, JSON.stringify(devices.body));
+    assert.ok(Array.isArray(devices.body));
+
+    // The employee role must not reach the biometric API, mirroring the nav rule.
+    await h.client.post('/api/auth/logout', {});
+    const empLogin = await h.client.post('/api/auth/login', { username: 'employee', password: 'admin123' });
+    assert.equal(empLogin.status, 200);
+    const forbidden = await h.client.get('/api/biometric/devices');
+    assert.equal(forbidden.status, 403);
+  } finally {
+    await h.close();
+  }
+});
+
+test('hr has biometric API access and Employees screen degrades if biometric lookups fail', async () => {
+  const h = await setup();
+  try {
+    // The other HR role must be able to use the biometric screen too.
+    const login = await h.client.post('/api/auth/login', { username: 'hr', password: 'admin123' });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.role, 'hr');
+    const devices = await h.client.get('/api/biometric/devices');
+    assert.equal(devices.status, 200, JSON.stringify(devices.body));
+    assert.ok(Array.isArray(devices.body));
+
+    // Static wiring check (no DOM harness in this repo): core employee data is
+    // loaded on its own, and the optional biometric lookups fall back to empty
+    // arrays inside a try/catch so a failure cannot block the screen.
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    const start = js.text.indexOf('async function screenEmployees()');
+    assert.ok(start >= 0, 'screenEmployees must exist');
+    const source = js.text.slice(start, js.text.indexOf('// ---', start));
+    assert.match(source,
+      /const \[employees, departments, designations, shifts\] = await Promise\.all\(\[/,
+      'core employee data must load without biometric calls');
+    assert.doesNotMatch(source, /designations\), api\/shifts'\),\s*api\('\/api\/biometric/);
+    assert.match(source, /let devices = \[\];/, 'device fallback must be an empty array');
+    assert.match(source, /try \{[\s\S]*?api\('\/api\/biometric\/devices'\)[\s\S]*?\} catch \{[\s\S]*?devices = \[\]/,
+      'biometric lookups must be guarded with an empty-array fallback');
+  } finally {
+    await h.close();
+  }
+});
+
+test('employee form clears stale mappings and muster counts approved leave', async () => {
+  const h = await setup();
+  try {
+    const js = await h.client.get('/app.js');
+    assert.equal(js.status, 200);
+    const src = js.text;
+
+    // Clearing the biometric code/device (or switching to Mobile) must unmap,
+    // otherwise punches keep attributing to the employee and reach payroll.
+    const empStart = src.indexOf('async function screenEmployees()');
+    assert.ok(empStart >= 0, 'screenEmployees must exist');
+    const empSrc = src.slice(empStart, src.indexOf('// ---', empStart));
+    assert.match(empSrc, /if \(source === 'mobile' \|\| !deviceId \|\| !code\) \{[\s\S]*?await unmap\(\)/,
+      'blank device/code must trigger an unmap');
+    assert.match(empSrc, /const unmap = async \(\) => \{[\s\S]*?mappings\/\$\{existing\.id\}[\s\S]*?method: 'DELETE'/,
+      'unmap must DELETE the existing mapping');
+
+    // Approved leave requests create no attendance rows, so the muster matrix
+    // must fetch them explicitly and mark their dates L.
+    const musterStart = src.indexOf('const buildMuster = () =>');
+    assert.ok(musterStart >= 0, 'muster matrix must exist');
+    const musterSrc = src.slice(musterStart, src.indexOf('// ---- Local-state tabs', musterStart));
+    assert.match(musterSrc, /api\('\/api\/leave\/requests\?status=approved'\)/,
+      'approved leave requests must be fetched for the muster matrix');
+    assert.match(musterSrc,
+      /status === 'Leave' \|\| leaveDatesByEmployee\.get\(String\(employeeId\)\)\?\.has\(date\)/,
+      'approved leave dates must render as L');
+  } finally {
+    await h.close();
+  }
+});
+
 test('unauthenticated API calls from the UI pattern still return 401', async () => {
   const h = await setup();
   try {
@@ -319,6 +414,36 @@ test('end-to-end walkthrough exercises every module through the production serve
     assert.equal(aliasCsv.status, 200, aliasCsv.text);
     assert.match(aliasCsv.headers.get('content-type'), /text\/csv/i);
     assert.match(aliasCsv.text, /employee_id/);
+
+    // --- 11. Biometric device -> import -> commit -> payroll ----------------
+    const device = await client.post('/api/biometric/devices', { name: 'E2E Gate', serialNumber: 'SN-E2E', ingestionMode: 'offline', adapter: 'zkteco_adms' });
+    assert.equal(device.status, 201);
+    assert.ok(device.body.id, 'a registered device must have an id');
+    assert.ok(device.body.pushToken, 'every device receives a random push token');
+    const mapping = await client.post(`/api/biometric/devices/${device.body.id}/mappings`, { employeeId: empId, deviceUserId: '9001' });
+    assert.equal(mapping.status, 201);
+    const imported = await client.post('/api/biometric/import', {
+      deviceId: device.body.id, format: 'zkteco', text: '9001\t2026-02-03 09:00:00\t0\t1\t0\n9001\t2026-02-03 18:00:00\t1\t1\t0\n',
+    });
+    assert.equal(imported.status, 201, JSON.stringify(imported.body));
+    assert.equal(imported.body.inserted, 2);
+    const committed = await client.post('/api/biometric/punches/commit', { deviceId: device.body.id });
+    assert.equal(committed.body.committed, 2);
+    const punches = await client.get(`/api/biometric/punches?deviceId=${device.body.id}`);
+    assert.equal(punches.status, 200);
+    assert.equal(punches.body.length, 2);
+    assert.ok(punches.body.every((p) => p.status === 'committed'), 'both punches must be committed');
+
+    // Run payroll for the punch month and assert the payslip exists / present
+    // days counted from the committed first-in/last-out pair.
+    const bioRun = await client.post('/api/payroll/run', { month: 2, year: YEAR });
+    assert.equal(bioRun.status, 200, JSON.stringify(bioRun.body));
+    const bioSlip = bioRun.body.slips.find((s) => s.employee_id === empId);
+    assert.ok(bioSlip, 'payroll must produce a slip for the biometric employee');
+    assert.equal(bioSlip.present_days, 1, 'the committed punch pair counts as one present day');
+    const bioSlipView = await client.get(`/api/payroll/slips/${bioSlip.id}`);
+    assert.equal(bioSlipView.status, 200);
+    assert.equal(bioSlipView.body.present_days, 1);
 
     // --- Logout closes the session -----------------------------------------
     const logout = await client.post('/api/auth/logout', {});

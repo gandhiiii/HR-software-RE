@@ -1,9 +1,11 @@
 # HRMS — local, offline human-resources management
 
 A single-process HRMS web app built with **Node.js built-in modules only**. No npm
-dependencies, no build step, no external services, no network calls. The server
-binds to **127.0.0.1:3000** and serves both a browser SPA and a JSON API backed
-by a local SQLite database (`node:sqlite`).
+dependencies, no build step, no required external services. By default it makes
+no network calls and binds to **127.0.0.1:3000**, serving both a browser SPA and
+a JSON API backed by a local SQLite database (`node:sqlite`). Biometric device
+push and polling are optional, opt-in integrations (see below); nothing contacts
+a device unless you explicitly configure and enable it.
 
 ## Requirements and startup
 
@@ -20,9 +22,31 @@ Then open <http://127.0.0.1:3000/>. (`npm start` is an equivalent alias.)
 
 On first start the app creates `data/hrms.db`, applies the schema, and seeds
 reference data. Seeding only runs when the `users` table is empty, so subsequent
-starts reuse existing data. Stop the server with `Ctrl+C`; SIGINT/SIGTERM close
-the database cleanly. Override the port/host only by editing `PORT`/`HOST` in
-`server.js` (the default is fixed at `127.0.0.1:3000`).
+starts reuse existing data. New tables added in later versions (including the
+biometric tables) are created automatically on the next start through
+`CREATE TABLE IF NOT EXISTS`; existing rows are never dropped or rewritten, so
+upgrading an existing database does not lose data. There is no destructive
+migration step. Stop the server with `Ctrl+C`; SIGINT/SIGTERM close the database
+cleanly and stop the optional biometric poller.
+
+### Host and port
+
+The bind address is controlled by two environment variables:
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `HOST`   | `127.0.0.1` | Interface to listen on. |
+| `PORT`   | `3000`      | TCP port to listen on. |
+
+```sh
+HOST=127.0.0.1 PORT=3000 node server.js
+```
+
+> **LAN-exposure warning:** the defaults keep the app on loopback only. Setting
+> `HOST=0.0.0.0` (or a LAN address) exposes it to other machines. This is a
+> local demo with public seed passwords, in-memory sessions, no TLS, no CSRF
+> token beyond `SameSite=Lax`, and no rate limiting — do **not** expose it on an
+> untrusted or public network.
 
 ## Seed credentials
 
@@ -56,6 +80,7 @@ at `/` and is purely static (`public/index.html`, `public/app.js`,
 | Assets | `api/assets.js` | Asset register CRUD, assign/return, assignment history |
 | Reports | `api/reports.js` | Dashboard + attendance/leave/payroll/expense reports (JSON or CSV) |
 | Settings | `api/settings.js` | 18-key settings map, holiday CRUD |
+| Biometric | `api/biometric.js` | Device registry + employee mapping, punch import/push/poll, review & commit to attendance, sync history |
 
 API conventions:
 
@@ -75,6 +100,43 @@ API conventions:
 - The app uses the local system clock/timezone for "today" and stores ISO dates
   (`YYYY-MM-DD`). Payroll does **not** recompute on read — reports read the
   payslips stored by a payroll run.
+
+### Biometric endpoints
+
+Biometric routes are restricted to HR roles (`admin`, `hr`) unless noted. Devices
+are configured with an `ingestionMode` of `offline` (manual import), `push`
+(device-initiated HTTP) or `poll` (server-initiated HTTP); each device gets a
+random `pushToken` that is the credential for its push webhook.
+
+**HR configuration and review**
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `GET /api/biometric/devices`, `POST /api/biometric/devices` | List / register devices |
+| `GET, PATCH, DELETE /api/biometric/devices/:id` | Read / update / remove a device |
+| `GET, POST /api/biometric/devices/:id/mappings` | List / add device-user ↔ employee mappings |
+| `DELETE /api/biometric/devices/:id/mappings/:mappingId` | Remove a mapping |
+| `POST /api/biometric/devices/:id/poll` | Fetch and ingest one device's JSON batch now |
+| `POST /api/biometric/import` | Import offline punch text (`format`: `csv`, `tsv`, `zkteco` or `json`) |
+| `GET /api/biometric/punches`, `POST /api/biometric/punches/commit` | Review queue / commit pending pairs to attendance |
+| `POST /api/biometric/punches/:id/map`, `.../:id/reject` | Manually map or reject a punch |
+| `GET /api/biometric/sync-runs` | Ingest history (received/inserted/duplicates/rejected) |
+
+**Device-facing (public) endpoints** authenticate in-handler, not via the session
+cookie:
+
+- `POST /api/biometric/push/:token` — generic JSON push webhook; the URL token is
+  the credential, with an optional `Bearer` secret on the device.
+- `GET/POST /iclock/cdata`, `GET /iclock/getrequest`, `GET /iclock/ping` — ZKTeco
+  ADMS **text-over-HTTP** endpoints (plain-text replies, headerless tab-separated
+  ATTLOG rows on POST). These implement the ADMS HTTP protocol only; the vendor's
+  proprietary binary protocol (direct TCP/4370) is **not** supported.
+
+Ingest is idempotent (punches are deduped by device + user + timestamp +
+direction) and non-destructive: committing never overwrites an existing
+attendance row. When a device has `autoCommit` enabled, complete pairs are
+committed as they arrive; otherwise punches wait in a review queue. Committed
+days flow into the normal attendance/payroll pipeline — no separate pay logic.
 
 ## Calculation rules (India / INR / Gregorian)
 
@@ -129,9 +191,12 @@ or paying a slip moves that month's flagged, approved expenses to `reimbursed`.
 - Cookie-based login/logout, explicit role checks, clean validation/error
   statuses, and CSV exports with formula-injection protection.
 - Local SQLite persistence with deterministic seed data; process-local
-  sessions; no network access required.
+  sessions; no network access required in the default configuration.
+- Opt-in biometric device integration: registry and mappings, offline/push/poll
+  ingest with dedupe, a review queue, and non-destructive commit into attendance.
 - `tests/e2e.test.js` walks the entire application from login through every
-  module to CSV export against the same wiring production uses.
+  module — including a biometric device → import → commit → payroll path — to
+  CSV export against the same wiring production uses.
 
 ## Explicit non-goals / known limits
 
@@ -144,18 +209,39 @@ or paying a slip moves that month's flagged, approved expenses to `reimbursed`.
 - **Simplified statutory math.** Flat income-tax rate with no slabs, rebates,
   TDS, or exemptions; PF/ESIC use the flat rules above; no gratuity, professional
   tax slabs, or state-specific variations. This is not payroll-compliance software.
-- **No integrations:** no email/SMS notifications, no bank/payment gateway, no
-  file/document uploads or receipt storage, no Aadhaar/PAN handling, and no
-  external services of any kind.
-- **No database migrations or upgrade path.** The schema is created with
-  `CREATE TABLE IF NOT EXISTS`; changing it requires a fresh `data/hrms.db`.
-- **No background jobs or scheduler.** Attendance, reminders, and payroll are
-  driven explicitly through the API/UI.
+- **No built-in third-party integrations:** no email/SMS notifications, no
+  bank/payment gateway, no file/document uploads or receipt storage, and no
+  Aadhaar/PAN handling. The only device integration is the optional biometric
+  feature, and its push and polling modes are strictly opt-in — a device must be
+  explicitly configured and enabled before the app ever contacts or accepts data
+  from it. No external service is required.
+- **No database migrations framework.** All tables (including the biometric
+  ones) are created with `CREATE TABLE IF NOT EXISTS`, so new tables are added to
+  an existing `data/hrms.db` on the next start without data loss. Altering the
+  columns of an existing table is not automated and may still require manual
+  intervention or a fresh database.
+- **No general background job scheduler.** Attendance, leave, reminders and
+  payroll are driven explicitly through the API/UI. The sole exception is the
+  biometric poller: an in-process timer started only in the production entry
+  point, and only for devices explicitly configured with `ingestionMode='poll'`
+  and `enabled=1`. API tests do not start it; there are no persisted schedules.
 - Dependencies are intentionally limited to Node.js built-ins; there is no build
   step, bundler, transpiler, or TypeScript.
 
 ### Known simplifications
 
+- **Biometric pairing is first-in / last-out.** Per device, an employee's
+  punches for a day are collapsed into a single attendance day using the first
+  in and the last out. Break-in/break-out codes are treated like in/out, a lone
+  in still counts as a present day with no punch-out, and an out just after
+  midnight attaches to the preceding day's group. Unmapped punches stay pending
+  until a mapping exists, and commit never overwrites an attendance row that was
+  already recorded manually.
+- **ZKTeco status `255` is treated as "unknown direction".** Firmware uses `255`
+  for a "normal" punch without a reliable in/out flag, so the pairing engine
+  infers direction from context (alternating in/out) instead of trusting the
+  code. Only the ADMS **text-over-HTTP** protocol is implemented; the vendor's
+  binary TCP/4370 protocol is explicitly deferred and not supported.
 - **Cross-month leave is not prorated.** Payroll counts the full `days` value of
   every approved unpaid-leave request that overlaps the payroll month. A single
   request spanning two months therefore contributes its full day count to each
@@ -175,9 +261,10 @@ node --test
 ```
 
 The suite covers database/seed, validation, repository helpers, auth and
-router behaviour, every API module, static UI serving, and the full end-to-end
-walkthrough. All tests use fresh in-memory databases and ephemeral ports, so
-they never touch `data/hrms.db` or port 3000.
+router behaviour, every API module (including the biometric parser, ingest and
+routes), static UI serving, and the full end-to-end walkthrough. The e2e test
+uses fresh in-memory databases and ephemeral ports, so it never touches
+`data/hrms.db` or port 3000, and it does not start the background poller.
 
 ### Browser acceptance check
 

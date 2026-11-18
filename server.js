@@ -22,9 +22,11 @@ import { registerTaskRoutes } from './api/tasks.js';
 import { registerAssetRoutes } from './api/assets.js';
 import { registerReportRoutes } from './api/reports.js';
 import { registerSettingsRoutes } from './api/settings.js';
+import { registerBiometricRoutes } from './api/biometric.js';
+import { createPoller } from './lib/biometric-poller.js';
 
-const HOST = '127.0.0.1';
-const PORT = 3000;
+const HOST = process.env.HOST || '127.0.0.1';
+const PORT = Number(process.env.PORT || 3000);
 
 /**
  * Register every feature module on a router. Auth routes are registered inside
@@ -45,6 +47,7 @@ export function registerAllRoutes(router) {
   registerAssetRoutes(router);
   registerReportRoutes(router);
   registerSettingsRoutes(router);
+  registerBiometricRoutes(router);
 }
 
 /**
@@ -96,12 +99,17 @@ if (isMain) {
   // The production entry point registers the complete application: auth plus
   // every feature module via registerAllRoutes (see above).
   const server = startServer({ db, registerRoutes: registerAllRoutes });
+  // Polling is opt-in and only ever started here in the production main guard.
+  // API tests call startServer directly, so no background timer runs in tests.
+  const poller = createPoller({ db });
   const { port, host } = server.bindAddress;
   server.listen(port, host, () => {
     console.log(`HRMS listening on http://${host}:${port}`);
+    poller.start();
   });
 
   const shutdown = () => {
+    poller.stop();
     server.close(() => {
       db.close();
       process.exit(0);
