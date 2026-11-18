@@ -28,6 +28,7 @@ import {
   resolvePunchEmployees,
   commitPending,
 } from '../lib/biometric-ingest.js';
+import { pollDeviceOnce } from '../lib/biometric-poller.js';
 
 const HR_ROLES = ['admin', 'hr'];
 
@@ -349,6 +350,14 @@ function importPunches(db, body) {
   return { status: 201, body: result };
 }
 
+/** Manual poll: fetch one device's endpoint now and ingest its JSON batch. */
+async function pollDevice(db, rawId) {
+  const { device } = getDeviceOr404(db, rawId);
+  if (!device.poll_endpoint) throw httpError(400, 'Device has no poll_endpoint configured');
+  const result = await pollDeviceOnce(db, device);
+  return { status: 200, body: result };
+}
+
 /** List stored punches, optionally filtered by device, status and employee. */
 function listPunches(db, query) {
   const clauses = [];
@@ -570,4 +579,10 @@ export function registerBiometricRoutes(router) {
     admsAttLog(db, query, body, headers), { rawBody: true });
   router.register('GET', '/iclock/getrequest', [], async () => admsOk());
   router.register('GET', '/iclock/ping', [], async () => admsOk());
+
+  // Manual poll run, using the same fetch/parse/ingest path as the background
+  // poller. Restricted to HR roles like the other device-configuration routes.
+  router.register('POST', '/api/biometric/devices/:id/poll', HR_ROLES, async ({ db, params }) =>
+    pollDevice(db, params.id),
+  );
 }

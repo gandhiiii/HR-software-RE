@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { makeDb, makeClient } from './helpers.js';
 import { startServer } from '../server.js';
 import { registerBiometricRoutes } from '../api/biometric.js';
@@ -272,4 +273,31 @@ test('oversized push body returns 413 and malformed JSON returns 400', async () 
     assert.equal((await h.client.postRaw(url, 'x'.repeat(1024 * 1024 + 1), 'application/json')).status, 413);
     assert.equal((await h.client.postRaw(url, 'not json', 'application/json')).status, 400);
   } finally { await h.close(); }
+});
+
+// ---------------------------------------------------------------------------
+// Polling: manual fetch from a mock device endpoint
+// ---------------------------------------------------------------------------
+
+test('manual poll fetches punches from a mock device HTTP endpoint', async () => {
+  // start a local http.createServer returning {"records":[...]} on /punches
+  const mockServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      records: [{ userId: '1042', timestamp: '2026-01-05 09:05:00', direction: 'in' }],
+    }));
+  });
+  await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+  const mockPort = mockServer.address().port;
+  const h = await setup();
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'Poll Device', serialNumber: 'SN-POLL', ingestionMode: 'poll',
+      adapter: 'http_json', pollEndpoint: `http://127.0.0.1:${mockPort}/punches`,
+    })).body;
+    await h.client.post(`/api/biometric/devices/${device.id}/mappings`, { employeeId: 3, deviceUserId: '1042' });
+    const res = await h.client.post(`/api/biometric/devices/${device.id}/poll`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.inserted, 1);
+  } finally { await h.close(); await new Promise((resolve) => mockServer.close(resolve)); }
 });
