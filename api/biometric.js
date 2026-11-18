@@ -20,6 +20,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { getRow, listRows, insertRow, updateRow, deleteRow } from '../lib/repo.js';
+import { verifyPassword } from '../lib/auth.js';
 import { requireFields } from '../lib/validate.js';
 import { parsePunchText } from '../lib/calc/biometric.js';
 import {
@@ -418,6 +419,88 @@ function listSyncRuns(db, query) {
   return { status: 200, body: listRows(db, 'biometric_sync_runs', whereSql, params) };
 }
 
+// ---------------------------------------------------------------------------
+// Device-facing push paths (public, authenticated in-handler)
+// ---------------------------------------------------------------------------
+
+/** Plain-text response header shared by every ZKTeco ADMS reply. */
+const ADMS_TEXT_HEADER = { 'Content-Type': 'text/plain; charset=utf-8' };
+
+/** Look up a device by its unguessable push token (null when absent). */
+function deviceByPushToken(db, token) {
+  if (typeof token !== 'string' || token === '') return null;
+  return listRows(db, 'biometric_devices', 'push_token = ?', [token])[0] ?? null;
+}
+
+/** Look up a device by the serial number a ZKTeco device reports as `SN`. */
+function deviceBySerial(db, serial) {
+  if (typeof serial !== 'string' || serial === '') return null;
+  return listRows(db, 'biometric_devices', 'serial_number = ?', [serial])[0] ?? null;
+}
+
+/** Extract a bearer secret from an Authorization header, or null. */
+function bearerSecret(headers) {
+  const header = headers?.authorization ?? headers?.Authorization;
+  if (typeof header !== 'string') return null;
+  const match = /^Bearer\s+(\S+)$/i.exec(header.trim());
+  return match ? match[1] : null;
+}
+
+/**
+ * A device without a stored secret needs no bearer token; one with a secret
+ * MUST present a matching `Bearer` token. `push_secret_hash` is `salt:hash`.
+ */
+function verifyDeviceSecret(device, headers) {
+  const stored = device.push_secret_hash;
+  if (stored === null || stored === undefined || stored === '') return true;
+  const secret = bearerSecret(headers);
+  if (secret === null) return false;
+  const separator = stored.indexOf(':');
+  if (separator <= 0 || separator === stored.length - 1) return false;
+  return verifyPassword(secret, stored.slice(0, separator), stored.slice(separator + 1));
+}
+
+function deviceAutoCommit(device) {
+  return device.auto_commit === 1 || device.auto_commit === true;
+}
+
+/** Generic JSON webhook: the token in the URL is the credential. */
+function pushJsonBatch(db, token, body, headers) {
+  const device = deviceByPushToken(db, token);
+  if (!device || !verifyDeviceSecret(device, headers)) throw httpError(401, 'Invalid push token');
+  const { rows } = parsePunchText(JSON.stringify(body ?? {}), 'json');
+  const result = ingestPunches(db, device, rows, 'push', { autoCommit: deviceAutoCommit(device) });
+  return { status: 200, body: { received: result.received, inserted: result.inserted } };
+}
+
+/** Resolve + authenticate the device behind an ADMS serial number. */
+function admsDevice(db, query, headers) {
+  const device = deviceBySerial(db, query?.SN);
+  if (!device || !verifyDeviceSecret(device, headers)) {
+    throw httpError(401, 'Invalid device serial number');
+  }
+  return device;
+}
+
+/** ADMS devices poll this endpoint for their configuration on startup. */
+function admsOptions(db, query, headers) {
+  admsDevice(db, query, headers);
+  return { status: 200, body: 'GET OPTIONS\nRealtime=1\n', headers: ADMS_TEXT_HEADER };
+}
+
+/** Headerless, tab-separated ATTLOG rows: acknowledge with `OK: <inserted>`. */
+function admsAttLog(db, query, body, headers) {
+  const device = admsDevice(db, query, headers);
+  const { rows } = parsePunchText(body, 'zkteco');
+  const result = ingestPunches(db, device, rows, 'push', { autoCommit: deviceAutoCommit(device) });
+  return { status: 200, body: `OK: ${result.inserted}`, headers: ADMS_TEXT_HEADER };
+}
+
+/** Maintenance replies from the ADMS handshake are plain-text `OK`. */
+function admsOk() {
+  return { status: 200, body: 'OK', headers: ADMS_TEXT_HEADER };
+}
+
 /** Register all biometric routes. */
 export function registerBiometricRoutes(router) {
   router.register('GET', '/api/biometric/devices', HR_ROLES, async ({ db }) => listDevices(db));
@@ -471,4 +554,20 @@ export function registerBiometricRoutes(router) {
   router.register('POST', '/api/biometric/punches/:id/reject', HR_ROLES, async ({ db, params, body }) =>
     rejectPunch(db, params.id, body),
   );
+
+  // Public device-facing push paths. They authenticate in-handler (never via
+  // the session middleware) and are therefore registered with `roles: []`.
+  router.register('POST', '/api/biometric/push/:token', [], async ({ db, params, body, headers }) =>
+    pushJsonBatch(db, params.token, body, headers),
+  );
+
+  // ZKTeco ADMS protocol. Replies are plain text, not JSON, and the ATTLOG POST
+  // opts into the router's raw-body handling so tab-separated rows survive.
+  router.register('GET', '/iclock/cdata', [], async ({ db, query, headers }) =>
+    admsOptions(db, query, headers),
+  );
+  router.register('POST', '/iclock/cdata', [], async ({ db, query, body, headers }) =>
+    admsAttLog(db, query, body, headers), { rawBody: true });
+  router.register('GET', '/iclock/getrequest', [], async () => admsOk());
+  router.register('GET', '/iclock/ping', [], async () => admsOk());
 }

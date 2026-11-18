@@ -222,3 +222,54 @@ test('auto_commit keeps unmapped pairs pending so they re-resolve after mapping'
     assert.equal(att.body[0].status, 'Present');
   } finally { await h.close(); }
 });
+
+// ---------------------------------------------------------------------------
+// Push paths: generic JSON webhook and ZKTeco ADMS
+// ---------------------------------------------------------------------------
+
+test('generic push authenticates by token and ingests a JSON batch', async () => {
+  const h = await setup('hr');
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'Push Gate', serialNumber: 'SN-PUSH', ingestionMode: 'push', adapter: 'generic_json',
+    })).body;
+    await h.client.post(`/api/biometric/devices/${device.id}/mappings`, { employeeId: 3, deviceUserId: '1042' });
+    await h.client.post('/api/auth/logout'); // push needs no session
+    assert.equal((await h.client.post('/api/biometric/push/wrong-token', { records: [] })).status, 401);
+    const ok = await h.client.post(`/api/biometric/push/${device.pushToken}`, {
+      records: [{ userId: '1042', timestamp: '2026-01-10 09:05:00', direction: 'in' }],
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.inserted, 1);
+  } finally { await h.close(); }
+});
+
+test('ZKTeco ADMS registration returns options text and ATTLOG POST returns OK: n', async () => {
+  const h = await setup('hr');
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'ADMS', serialNumber: 'SN-ADMS', ingestionMode: 'push', adapter: 'zkteco_adms',
+    })).body;
+    await h.client.post(`/api/biometric/devices/${device.id}/mappings`, { employeeId: 3, deviceUserId: '1042' });
+    await h.client.post('/api/auth/logout');
+    const reg = await h.client.get('/iclock/cdata?SN=SN-ADMS&options=all');
+    assert.equal(reg.status, 200);
+    assert.match(reg.text, /Realtime=1/);
+    const push = await h.client.postRaw('/iclock/cdata?SN=SN-ADMS&table=ATTLOG',
+      '1042\t2026-01-10 09:05:00\t0\t1\t0\n', 'text/plain');
+    assert.equal(push.status, 200);
+    assert.equal(push.text, 'OK: 1');
+  } finally { await h.close(); }
+});
+
+test('oversized push body returns 413 and malformed JSON returns 400', async () => {
+  const h = await setup('hr');
+  try {
+    const device = (await h.client.post('/api/biometric/devices', {
+      name: 'Limits', serialNumber: 'SN-LIMIT', ingestionMode: 'push',
+    })).body;
+    const url = `/api/biometric/push/${device.pushToken}`;
+    assert.equal((await h.client.postRaw(url, 'x'.repeat(1024 * 1024 + 1), 'application/json')).status, 413);
+    assert.equal((await h.client.postRaw(url, 'not json', 'application/json')).status, 400);
+  } finally { await h.close(); }
+});

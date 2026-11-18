@@ -22,16 +22,16 @@ export function makeClient(server) {
   }
 
   async function request(method, path, options = {}) {
-    const { body, headers = {} } = options;
+    const { body, headers = {}, raw = false, contentType } = options;
     const requestHeaders = { ...headers };
-    if (body !== undefined) requestHeaders['content-type'] = 'application/json';
+    if (body !== undefined) requestHeaders['content-type'] = contentType ?? 'application/json';
     const cookie = cookieHeader();
     if (cookie) requestHeaders.cookie = cookie;
 
     const res = await fetch(base + path, {
       method,
       headers: requestHeaders,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: body !== undefined ? (raw ? body : JSON.stringify(body)) : undefined,
       redirect: 'manual',
     });
 
@@ -62,6 +62,7 @@ export function makeClient(server) {
     request,
     get: (path, options) => request('GET', path, options),
     post: (path, body, options) => request('POST', path, { ...options, body }),
+    postRaw: (path, body, contentType) => request('POST', path, { body, raw: true, contentType }),
     put: (path, body, options) => request('PUT', path, { ...options, body }),
     patch: (path, body, options) => request('PATCH', path, { ...options, body }),
     delete: (path, options) => request('DELETE', path, options),
